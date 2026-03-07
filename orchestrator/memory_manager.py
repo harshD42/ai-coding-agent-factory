@@ -1,21 +1,22 @@
 """
 memory_manager.py — ChromaDB client + embedding via Ollama.
 
+Step 2.5: rerank(query, results) added.  Called after embedding search
+          in recall() and search_codebase() to improve precision.
+          Uses the Ollama /api/rerank endpoint (nomic-embed-text family
+          or Qwen3-Reranker-0.6B if available).  Falls back gracefully
+          to the original order if the reranker is unreachable.
+
 Collections:
     sessions   — conversation history, decisions, outcomes per session
     codebase   — embedded file chunks from the project
     skills     — learned patterns extracted from sessions
     failures   — failed patches, test failures, rejected approaches
-
-Embedding:
-    Uses Ollama's /api/embeddings endpoint with nomic-embed-text.
-    Falls back gracefully if Ollama is unreachable during startup.
 """
 
 import asyncio
 import hashlib
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -27,15 +28,12 @@ import config
 
 log = logging.getLogger("memory")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-
 COLLECTION_NAMES = ["sessions", "codebase", "skills", "failures"]
-CHUNK_SIZE       = 100   # lines per chunk when indexing files
-CHUNK_OVERLAP    = 10    # lines of overlap between chunks
-MAX_FILE_SIZE    = 500_000  # bytes — skip files larger than this
-SEARCH_K         = 5        # default number of results to return
+CHUNK_SIZE       = 100
+CHUNK_OVERLAP    = 10
+MAX_FILE_SIZE    = 500_000
+SEARCH_K         = 5
 
-# File extensions to index
 INDEXABLE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java",
     ".c", ".cpp", ".h", ".cs", ".rb", ".php", ".swift", ".kt",
@@ -48,15 +46,20 @@ SKIP_DIRS = {
     "dist", "build", ".next", "target", ".cache", ".idea", ".vscode",
 }
 
+# ── Reranker config ───────────────────────────────────────────────────────────
+
+# Reranker model name sent to Ollama's /api/rerank endpoint.
+# On the laptop profile nomic-reranker may not be available; the method
+# falls back silently.  Set RERANKER_MODEL="" to disable entirely.
+RERANKER_MODEL   = "nomic-reranker"
+RERANKER_TIMEOUT = 5.0   # seconds — skip reranking if model is slow
+
 # ── Embedding client ──────────────────────────────────────────────────────────
 
 _http = httpx.AsyncClient(timeout=60.0)
 
+
 async def _embed(text: str) -> list[float]:
-    """
-    Get embedding vector from Ollama nomic-embed-text.
-    Returns a 768-dim float list.
-    """
     resp = await _http.post(
         f"{config.OLLAMA_URL}/api/embeddings",
         json={"model": "nomic-embed-text", "prompt": text},
@@ -66,7 +69,6 @@ async def _embed(text: str) -> list[float]:
 
 
 async def _embed_batch(texts: list[str]) -> list[list[float]]:
-    """Embed a list of texts sequentially (Ollama has no batch endpoint)."""
     results = []
     for t in texts:
         results.append(await _embed(t))
@@ -77,16 +79,15 @@ async def _embed_batch(texts: list[str]) -> list[list[float]]:
 
 class MemoryManager:
     def __init__(self):
-        self._client: Optional[chromadb.AsyncHttpClient] = None
+        self._client:      Optional[chromadb.AsyncHttpClient] = None
         self._collections: dict = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def connect(self):
-        """Connect to ChromaDB and ensure all collections exist. Retries up to 10x."""
         for attempt in range(10):
             try:
-                url = config.CHROMA_URL
+                url  = config.CHROMA_URL
                 host, port = url.replace("http://", "").split(":")
                 self._client = await chromadb.AsyncHttpClient(host=host, port=int(port))
                 await self._client.heartbeat()
@@ -95,7 +96,7 @@ class MemoryManager:
                 log.info("ChromaDB connected. Collections: %s", COLLECTION_NAMES)
                 return
             except Exception as e:
-                log.warning("ChromaDB connect attempt %d/10 failed: %s", attempt + 1, e)
+                log.warning("ChromaDB connect attempt %d/10: %s", attempt + 1, e)
                 if attempt < 9:
                     await asyncio.sleep(3)
                 else:
@@ -106,24 +107,19 @@ class MemoryManager:
 
     def _col(self, name: str):
         if name not in self._collections:
-            raise RuntimeError(f"Collection {name!r} not initialised. Call connect() first.")
+            raise RuntimeError(f"Collection {name!r} not initialised — call connect() first.")
         return self._collections[name]
 
     # ── Codebase indexing ─────────────────────────────────────────────────────
 
     async def index_codebase(self, workspace: str = "/workspace") -> dict:
-        """
-        Walk the workspace, chunk all indexable files, embed and upsert
-        into the 'codebase' collection. Returns a summary dict.
-        """
-        root    = Path(workspace)
-        col     = self._col("codebase")
-        indexed = 0
-        skipped = 0
+        root        = Path(workspace)
+        col         = self._col("codebase")
+        indexed     = 0
+        skipped     = 0
         chunks_total = 0
 
         for path in root.rglob("*"):
-            # Skip directories and hidden/build dirs
             if any(part in SKIP_DIRS for part in path.parts):
                 continue
             if not path.is_file():
@@ -131,7 +127,6 @@ class MemoryManager:
             if path.suffix.lower() not in INDEXABLE_EXTENSIONS:
                 continue
             if path.stat().st_size > MAX_FILE_SIZE:
-                log.debug("skip large file: %s", path)
                 skipped += 1
                 continue
 
@@ -144,11 +139,10 @@ class MemoryManager:
 
             rel_path = str(path.relative_to(root))
             chunks   = _chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-
             ids, docs, metas = [], [], []
             for i, chunk in enumerate(chunks):
-                chunk_id = _make_id(rel_path, i)
-                ids.append(chunk_id)
+                cid = _make_id(rel_path, i)
+                ids.append(cid)
                 docs.append(chunk)
                 metas.append({"file": rel_path, "chunk": i, "total_chunks": len(chunks)})
 
@@ -168,14 +162,14 @@ class MemoryManager:
         return {"files_indexed": indexed, "chunks": chunks_total, "skipped": skipped}
 
     async def search_codebase(self, query: str, k: int = SEARCH_K) -> list[dict]:
-        """Semantic search over indexed codebase chunks."""
-        return await self._search("codebase", query, k)
+        """Semantic search over indexed codebase chunks, with reranking (Step 2.5)."""
+        results = await self._search("codebase", query, k * 2)   # over-fetch for reranker
+        return await self.rerank(query, results, top_k=k)
 
     # ── Session memory ────────────────────────────────────────────────────────
 
     async def save_session(self, session_id: str, content: str, metadata: dict = None) -> None:
-        """Persist a session summary to ChromaDB."""
-        col = self._col("sessions")
+        col    = self._col("sessions")
         doc_id = f"session:{session_id}:{int(time.time())}"
         emb    = await _embed(content)
         meta   = {"session_id": session_id, "ts": int(time.time()), **(metadata or {})}
@@ -183,34 +177,29 @@ class MemoryManager:
         log.info("saved session %s", session_id)
 
     async def recall(self, query: str, k: int = SEARCH_K) -> list[dict]:
-        """Search across sessions + failures for relevant past context."""
-        results = []
+        """Search sessions + failures, rerank, return top-k (Step 2.5)."""
+        raw = []
         for col_name in ("sessions", "failures"):
-            results += await self._search(col_name, query, k)
-        # Sort by distance (lower = more relevant) and return top-k overall
-        results.sort(key=lambda x: x.get("distance", 1.0))
-        return results[:k]
+            raw += await self._search(col_name, query, k)
+        raw.sort(key=lambda x: x.get("distance", 1.0))
+        raw = raw[: k * 2]   # over-fetch before reranking
+        return await self.rerank(query, raw, top_k=k)
 
     # ── Failure tracking ──────────────────────────────────────────────────────
 
     async def record_failure(
         self,
         session_id: str,
-        task_id: str,
+        task_id:    str,
         description: str,
-        error: str,
-        approach: str = "",
+        error:      str,
+        approach:   str = "",
     ) -> None:
-        """Record a failure so agents can avoid repeating the same mistakes."""
         col     = self._col("failures")
         content = f"TASK: {description}\nAPPROACH: {approach}\nERROR: {error}"
         doc_id  = f"failure:{session_id}:{task_id}:{int(time.time())}"
         emb     = await _embed(content)
-        meta    = {
-            "session_id": session_id,
-            "task_id":    task_id,
-            "ts":         int(time.time()),
-        }
+        meta    = {"session_id": session_id, "task_id": task_id, "ts": int(time.time())}
         await col.upsert(ids=[doc_id], documents=[content], embeddings=[emb], metadatas=[meta])
         log.info("recorded failure: session=%s task=%s", session_id, task_id)
 
@@ -228,13 +217,79 @@ class MemoryManager:
     async def search_skills(self, query: str, k: int = 3) -> list[dict]:
         return await self._search("skills", query, k)
 
+    # ── Step 2.5: Reranker ────────────────────────────────────────────────────
+
+    async def rerank(
+        self,
+        query:   str,
+        results: list[dict],
+        top_k:   int = SEARCH_K,
+    ) -> list[dict]:
+        """
+        Re-score *results* using Ollama's /api/rerank endpoint and return
+        the top_k highest-scoring items.
+
+        Falls back to the original embedding-distance order if:
+          - RERANKER_MODEL is empty
+          - the reranker endpoint is unavailable
+          - any error occurs
+
+        Each result dict gains a "rerank_score" key (higher = more relevant).
+        """
+        if not results:
+            return results
+
+        if not RERANKER_MODEL:
+            return results[:top_k]
+
+        documents = [r.get("content", "") for r in results]
+        try:
+            resp = await asyncio.wait_for(
+                _http.post(
+                    f"{config.OLLAMA_URL}/api/rerank",
+                    json={
+                        "model":     RERANKER_MODEL,
+                        "query":     query,
+                        "documents": documents,
+                    },
+                ),
+                timeout=RERANKER_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data    = resp.json()
+            # Ollama rerank response: {"results": [{"index": N, "relevance_score": F}, ...]}
+            ranked  = data.get("results", [])
+            scored  = sorted(ranked, key=lambda x: x.get("relevance_score", 0.0), reverse=True)
+
+            reranked = []
+            for item in scored[:top_k]:
+                idx = item.get("index", 0)
+                if 0 <= idx < len(results):
+                    entry = dict(results[idx])
+                    entry["rerank_score"] = item.get("relevance_score", 0.0)
+                    reranked.append(entry)
+
+            log.debug("rerank: %d → %d results for query %r", len(results), len(reranked), query[:60])
+            return reranked
+
+        except asyncio.TimeoutError:
+            log.warning("reranker timed out (%.1fs) — using original order", RERANKER_TIMEOUT)
+        except Exception as e:
+            log.warning("reranker unavailable (%s) — using original order", e)
+
+        # Fallback: return top_k by embedding distance
+        return results[:top_k]
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _search(self, collection: str, query: str, k: int) -> list[dict]:
         col = self._col(collection)
         try:
             emb    = await _embed(query)
-            result = await col.query(query_embeddings=[emb], n_results=k, include=["documents", "metadatas", "distances"])
+            result = await col.query(
+                query_embeddings=[emb], n_results=k,
+                include=["documents", "metadatas", "distances"],
+            )
             docs      = result["documents"][0]
             metas     = result["metadatas"][0]
             distances = result["distances"][0]
@@ -250,24 +305,21 @@ class MemoryManager:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _chunk_text(text: str, size: int, overlap: int) -> list[str]:
-    """Split text into overlapping line-based chunks."""
     lines  = text.splitlines(keepends=True)
     chunks = []
     i = 0
     while i < len(lines):
-        chunk = "".join(lines[i : i + size])
+        chunk = "".join(lines[i: i + size])
         if chunk.strip():
             chunks.append(chunk)
         i += size - overlap
-    return chunks or [text]  # always return at least one chunk
+    return chunks or [text]
 
 
 def _make_id(path: str, chunk_idx: int) -> str:
-    """Stable, collision-resistant chunk ID."""
-    raw = f"{path}::{chunk_idx}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+    return hashlib.sha256(f"{path}::{chunk_idx}".encode()).hexdigest()[:32]
 
 
-# ── Module-level singleton ────────────────────────────────────────────────────
+# ── Singleton ─────────────────────────────────────────────────────────────────
 
 memory = MemoryManager()

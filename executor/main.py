@@ -45,22 +45,51 @@ log = logging.getLogger("executor")
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Ensure workspace is a git repo on startup. Normalize CRLF in all files."""
-    # Normalize any CRLF files already in workspace (written by Windows tools)
+async def lifespan(app: FastAPI):  # noqa: F811  replaces the stub above
+    """
+    Ensure workspace is a git repo on startup.
+    - If not yet a repo: init, add all existing files, make an initial commit.
+    - If already a repo: ensure any untracked files are committed so
+      git apply --check has a clean baseline to work against.
+    - Normalize CRLF in all text files.
+    """
+    git = "/usr/bin/git"
+
+    # Normalize CRLF first (Windows-written files break git apply)
     for p in WORKSPACE_DIR.rglob("*"):
-        if p.is_file() and p.suffix in {".py", ".js", ".ts", ".md", ".txt", ".sh", ".yaml", ".yml", ".json", ".toml"}:
+        if p.is_file() and p.suffix in {
+            ".py", ".js", ".ts", ".md", ".txt", ".sh",
+            ".yaml", ".yml", ".json", ".toml"
+        }:
             _normalize_crlf(p)
 
-    git = "/usr/bin/git"
     git_dir = WORKSPACE_DIR / ".git"
     if not git_dir.exists():
-        subprocess.run([git, "init"],                                 cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run([git, "config", "user.email", "agent@local"], cwd=WORKSPACE_DIR, capture_output=True)
-        subprocess.run([git, "config", "user.name",  "Agent"],       cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run([git, "init"],                                  cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run([git, "config", "user.email", "agent@local"],  cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run([git, "config", "user.name",  "Agent"],        cwd=WORKSPACE_DIR, capture_output=True)
         log.info("git repo initialized at %s", WORKSPACE_DIR)
     else:
+        # Repo exists — ensure user identity is set (required for commits)
+        subprocess.run([git, "config", "user.email", "agent@local"],  cwd=WORKSPACE_DIR, capture_output=True)
+        subprocess.run([git, "config", "user.name",  "Agent"],        cwd=WORKSPACE_DIR, capture_output=True)
         log.info("git repo already exists at %s", WORKSPACE_DIR)
+
+    # Stage and commit any untracked or modified files so git apply
+    # always has a clean, committed baseline to apply patches against.
+    # This is idempotent — if nothing changed, git commit does nothing.
+    subprocess.run([git, "add", "-A"],                                 cwd=WORKSPACE_DIR, capture_output=True)
+    result = subprocess.run(
+        [git, "commit", "-m", "chore: baseline snapshot"],
+        cwd=WORKSPACE_DIR, capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        log.info("git baseline commit created")
+    else:
+        # "nothing to commit" is returncode 1 — that's fine
+        msg = result.stdout.strip() or result.stderr.strip()
+        log.info("git baseline: %s", msg)
+
     yield
 
 app = FastAPI(title="Executor", version="1.0.0", lifespan=lifespan)
@@ -253,8 +282,12 @@ def apply_patch(req: ApplyPatchRequest):
                 _normalize_crlf(target)
 
     try:
-        git_args = ["/usr/bin/git", "apply", "--check" if req.target == "sandbox" else None, patch_path]
-        git_args = [a for a in git_args if a]   # strip None
+        # --whitespace=fix: silently corrects trailing whitespace and blank-line
+        # issues rather than hard-rejecting the patch. Safe for all use cases.
+        if req.target == "sandbox":
+            git_args = ["/usr/bin/git", "apply", "--check", "--whitespace=fix", patch_path]
+        else:
+            git_args = ["/usr/bin/git", "apply", "--whitespace=fix", patch_path]
 
         log.info("patch  target=%s  lines=%d  file=%s", req.target, changed_lines, patch_path)
         proc = subprocess.run(
@@ -268,6 +301,8 @@ def apply_patch(req: ApplyPatchRequest):
         os.unlink(patch_path)
 
     if proc.returncode != 0:
+        # Log the full git error so we can debug without guessing
+        log.warning("git apply failed (target=%s):\n%s", req.target, proc.stderr.strip())
         return ApplyPatchResponse(
             applied=False,
             message=f"git apply failed:\n{proc.stderr.strip()}"

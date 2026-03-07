@@ -7,14 +7,16 @@ Task structure:
 Execution rules:
     - A task is only eligible when ALL its deps have status=complete
     - Tasks with no deps are immediately eligible
-    - Topological order is enforced — no task runs before its dependencies
-    - If a task fails, all tasks that depend on it (transitively) are marked blocked
+    - Topological order is enforced
+    - If a task fails, all transitive dependents are marked blocked
+    - Independent ready tasks run concurrently (Step 2.6, capped by MAX_PARALLEL_AGENTS)
 
 Redis key layout:
     tasks:{session_id}:{task_id}  →  JSON task dict
     tasklist:{session_id}         →  Redis list of task_ids (insertion order)
 """
 
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -23,13 +25,23 @@ import redis.asyncio as aioredis
 
 import config
 from agent_manager import AgentManager
+from utils import extract_diffs_from_result            # Step 2.1
 
 log = logging.getLogger("task_queue")
+
+# Roles whose output may contain patches that should be auto-applied.
+_PATCH_ROLES = {"coder", "tester"}                     # Step 2.1
 
 
 class TaskQueue:
     def __init__(self):
         self._redis: Optional[aioredis.Redis] = None
+        # Injected after construction to avoid circular import (TaskQueue ↔ PatchQueue)
+        self._patch_queue = None                        # Step 2.1
+
+    def set_patch_queue(self, pq) -> None:             # Step 2.1
+        """Wire in the PatchQueue singleton after both objects are created."""
+        self._patch_queue = pq
 
     async def connect(self):
         self._redis = await aioredis.from_url(
@@ -51,12 +63,10 @@ class TaskQueue:
         return f"tasklist:{session_id}"
 
     async def _save_task(self, session_id: str, task: dict) -> None:
-        key = self._task_key(session_id, task["id"])
-        await self._redis.set(key, json.dumps(task))
+        await self._redis.set(self._task_key(session_id, task["id"]), json.dumps(task))
 
     async def _load_task(self, session_id: str, task_id: str) -> Optional[dict]:
-        key = self._task_key(session_id, task_id)
-        raw = await self._redis.get(key)
+        raw = await self._redis.get(self._task_key(session_id, task_id))
         return json.loads(raw) if raw else None
 
     async def _all_task_ids(self, session_id: str) -> list[str]:
@@ -74,21 +84,14 @@ class TaskQueue:
     # ── Load plan ─────────────────────────────────────────────────────────────
 
     async def load_plan(self, session_id: str, tasks: list[dict]) -> dict:
-        """
-        Load a validated task list into Redis for a session.
-        Clears any existing tasks for this session first.
-        Returns a summary.
-        """
-        # Clear existing tasks
+        """Load a validated task list into Redis. Clears any existing tasks first."""
         old_ids = await self._all_task_ids(session_id)
         for tid in old_ids:
             await self._redis.delete(self._task_key(session_id, tid))
         await self._redis.delete(self._list_key(session_id))
 
-        # Validate DAG (no cycles)
         _validate_dag(tasks)
 
-        # Store each task
         for task in tasks:
             task["status"] = "pending"
             await self._save_task(session_id, task)
@@ -101,8 +104,8 @@ class TaskQueue:
 
     async def get_ready_tasks(self, session_id: str) -> list[dict]:
         """Return tasks whose deps are all complete and status is pending."""
-        tasks   = await self._all_tasks(session_id)
-        done    = {t["id"] for t in tasks if t["status"] == "complete"}
+        tasks = await self._all_tasks(session_id)
+        done  = {t["id"] for t in tasks if t["status"] == "complete"}
         return [
             t for t in tasks
             if t["status"] == "pending"
@@ -136,14 +139,12 @@ class TaskQueue:
         if result:
             task["result"] = result
         await self._save_task(session_id, task)
-
-        # If failed, mark all transitive dependents as blocked
         if status == "failed":
             await self._propagate_blocked(session_id, task_id)
 
     async def _propagate_blocked(self, session_id: str, failed_id: str) -> None:
         """Mark all tasks that (transitively) depend on failed_id as blocked."""
-        tasks = await self._all_tasks(session_id)
+        tasks   = await self._all_tasks(session_id)
         blocked = {failed_id}
         changed = True
         while changed:
@@ -157,44 +158,92 @@ class TaskQueue:
                         changed = True
                         log.info("blocked task %s (depends on failed %s)", t["id"], failed_id)
 
+    # ── Step 2.1: Auto-patch helper ───────────────────────────────────────────
+
+    async def _auto_apply_patches(
+        self, session_id: str, task: dict, output: str
+    ) -> list[dict]:
+        """
+        Extract diffs from *output* and enqueue each via patch_queue.
+
+        Only fires for coder/tester roles when a patch_queue is injected.
+        Errors are logged but never propagate — a patch failure must not
+        corrupt the parent task's completion status.
+
+        Returns a list of enqueue result dicts for observability.
+        """
+        if self._patch_queue is None:
+            return []
+        if task.get("role") not in _PATCH_ROLES:
+            return []
+
+        diffs = extract_diffs_from_result(output)
+        if not diffs:
+            log.debug("task %s: no diffs found in output", task["id"])
+            return []
+
+        log.info("task %s: found %d diff(s), auto-enqueueing", task["id"], len(diffs))
+        results = []
+        for i, diff in enumerate(diffs, 1):
+            try:
+                enq = await self._patch_queue.enqueue(
+                    diff=diff,
+                    agent_id=task.get("id", "auto"),
+                    task_id=task.get("id", "auto"),
+                    session_id=session_id,
+                    description=f"Auto-patch from task {task['id']} ({task.get('role')})",
+                )
+                result_dict = enq.to_dict() if hasattr(enq, "to_dict") else enq
+                log.info("task %s diff %d/%d enqueued: %s",
+                         task["id"], i, len(diffs), result_dict.get("patch_id", "?"))
+                results.append(result_dict)
+            except Exception as exc:
+                log.error("task %s diff %d/%d enqueue failed: %s",
+                          task["id"], i, len(diffs), exc)
+                results.append({"error": str(exc)})
+        return results
+
     # ── Execute plan ──────────────────────────────────────────────────────────
 
     async def execute_plan(
         self, session_id: str, agent_mgr: AgentManager
     ) -> dict:
         """
-        Execute all ready tasks sequentially until the plan is complete or stuck.
-        Returns a summary of what happened.
+        Execute all ready tasks until the plan is complete or stuck.
+
+        Step 2.1: diffs are auto-extracted and applied after each coder/tester task.
+        Step 2.6: independent ready tasks run concurrently (≤ MAX_PARALLEL_AGENTS).
         """
         executed = []
+
         while True:
             ready = await self.get_ready_tasks(session_id)
             if not ready:
                 break
 
-            for task in ready:
-                log.info("executing task %s (%s): %s",
-                         task["id"], task["role"], task["desc"][:80])
+            # Step 2.6: cap concurrency
+            batch = ready[: config.MAX_PARALLEL_AGENTS]
+
+            # Mark all as running before launching concurrently
+            for task in batch:
                 await self.update_status(session_id, task["id"], "running")
 
-                result = await agent_mgr.spawn_and_run(
-                    role=task["role"],
-                    task=task["desc"],
-                    session_id=session_id,
-                )
+            task_coros = [
+                self._run_single_task(session_id, task, agent_mgr)
+                for task in batch
+            ]
+            batch_results = await asyncio.gather(*task_coros, return_exceptions=True)
 
-                if result["status"] in ("done",):
+            for task, res in zip(batch, batch_results):
+                if isinstance(res, Exception):
+                    # gather caught an unhandled exception from _run_single_task
+                    log.error("unexpected error in task %s: %s", task["id"], res)
                     await self.update_status(
-                        session_id, task["id"], "complete",
-                        result=result.get("result", "")
-                    )
-                    executed.append({**task, "status": "complete"})
-                else:
-                    await self.update_status(
-                        session_id, task["id"], "failed",
-                        result=result.get("error", "unknown error")
+                        session_id, task["id"], "failed", result=str(res)
                     )
                     executed.append({**task, "status": "failed"})
+                else:
+                    executed.append(res)
 
         final = await self.get_session_status(session_id)
         return {
@@ -205,6 +254,49 @@ class TaskQueue:
             "remaining": final["pending"],
             "tasks":     executed,
         }
+
+    async def _run_single_task(
+        self, session_id: str, task: dict, agent_mgr: AgentManager
+    ) -> dict:
+        """
+        Run one task: spawn agent → auto-apply patches → update status.
+        Returns a task summary dict.
+        """
+        log.info("executing task %s (%s): %s",
+                 task["id"], task["role"], task["desc"][:80])
+
+        result = await agent_mgr.spawn_and_run(
+            role=task["role"],
+            task=task["desc"],
+            session_id=session_id,
+        )
+
+        output = result.get("result", "") or ""
+
+        # Step 2.1 — auto-apply any diffs found in coder/tester output
+        patch_results = await self._auto_apply_patches(session_id, task, output)
+        patches_ok    = sum(1 for r in patch_results if "error" not in r)
+        patches_fail  = len(patch_results) - patches_ok
+
+        if result["status"] == "done":
+            await self.update_status(session_id, task["id"], "complete", result=output)
+            return {
+                **task,
+                "status":          "complete",
+                "patches_applied": patches_ok,
+                "patches_failed":  patches_fail,
+            }
+        else:
+            await self.update_status(
+                session_id, task["id"], "failed",
+                result=result.get("error", "unknown error"),
+            )
+            return {
+                **task,
+                "status":          "failed",
+                "patches_applied": patches_ok,
+                "patches_failed":  patches_fail,
+            }
 
 
 # ── DAG validation ────────────────────────────────────────────────────────────
@@ -218,24 +310,21 @@ def _validate_dag(tasks: list[dict]) -> None:
                 raise ValueError(
                     f"Task {t['id']!r} depends on {dep!r} which doesn't exist"
                 )
-    # Kahn's algorithm cycle detection
     in_degree = {t["id"]: 0 for t in tasks}
-    for t in tasks:
-        for dep in t.get("deps", []):
-            in_degree[t["id"]] += 1
-    queue  = [tid for tid, deg in in_degree.items() if deg == 0]
-    visited = 0
     adj: dict[str, list[str]] = {t["id"]: [] for t in tasks}
     for t in tasks:
         for dep in t.get("deps", []):
+            in_degree[t["id"]] += 1
             adj[dep].append(t["id"])
+    queue   = [tid for tid, deg in in_degree.items() if deg == 0]
+    visited = 0
     while queue:
         node = queue.pop()
         visited += 1
-        for neighbor in adj[node]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
+        for nb in adj[node]:
+            in_degree[nb] -= 1
+            if in_degree[nb] == 0:
+                queue.append(nb)
     if visited != len(tasks):
         raise ValueError("Task DAG contains a cycle")
 

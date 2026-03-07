@@ -189,11 +189,20 @@ async def dispatch(
         data    = resp.json()
         content = data.get("message", {}).get("content", "")
         return {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion",
-            "created": int(time.time()), "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+            "id":      f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object":  "chat.completion",
+            "created": int(time.time()),
+            "model":   model,
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": content},
                          "finish_reason": "stop"}],
-            "usage": data.get("usage", {}),
+            # Pass Ollama's native token counts through so metrics.parse_usage()
+            # can find them. Ollama uses prompt_eval_count / eval_count at root.
+            "usage": {
+                "prompt_tokens":     data.get("prompt_eval_count", 0),
+                "completion_tokens": data.get("eval_count",         0),
+                "total_tokens":      data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
+            },
         }
     else:
         body = _build_vllm_body(msgs, model, req)

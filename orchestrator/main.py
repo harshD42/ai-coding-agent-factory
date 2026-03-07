@@ -1,10 +1,12 @@
 """
 main.py — Orchestrator entry point.
 
-Step 3: OpenAI-compatible proxy.
-  POST /v1/chat/completions  — Cline connects here
-  GET  /v1/models            — Cline queries this on startup
-  GET  /health               — Docker health check
+Phase 2 additions:
+  Step 2.1  task_queue.set_patch_queue() wired in lifespan
+  Step 2.2  POST /v1/patches/test   — apply patch + run test-fix loop
+  Step 2.3  GET  /v1/metrics        — aggregate token / latency metrics
+            /status command updated to include metrics summary
+  Step 2.4  file_watcher.start()    — real-time workspace hash registry
 """
 
 import logging
@@ -21,7 +23,9 @@ import router
 from agent_manager import init_agent_manager, get_agent_manager
 from command_parser import parse as parse_command, help_text
 from debate_engine import init_debate_engine, get_debate_engine
+from file_watcher import file_watcher                          # Step 2.4
 from memory_manager import memory
+from metrics import metrics                                    # Step 2.3
 from models import ChatCompletionRequest
 from patch_queue import patch_queue, PatchValidationError
 from session_hooks import init_session_hooks, get_session_hooks
@@ -37,34 +41,44 @@ log = logging.getLogger("orchestrator")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("connecting to ChromaDB...")
+    log.info("connecting to ChromaDB and Redis...")
     await memory.connect()
     await task_queue.connect()
+
+    # Step 2.1 — wire patch_queue into task_queue so diffs are auto-applied
+    task_queue.set_patch_queue(patch_queue)
+
     mgr = init_agent_manager(memory)
     init_debate_engine(mgr)
     init_session_hooks(memory)
     skill_loader.load()
+
+    # Step 2.4 — start file watcher (uses task_queue's Redis connection)
+    await file_watcher.start(task_queue._redis)
+
     log.info("all systems ready")
     yield
+
+    # Shutdown
+    await file_watcher.stop()                                  # Step 2.4
     await memory.close()
     await task_queue.close()
 
 
-app = FastAPI(title="AI Coding Agent Orchestrator", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="AI Coding Agent Orchestrator", version="0.2.0", lifespan=lifespan)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "profile": config.PROFILE, "version": "0.6.0"}
+    return {"status": "ok", "profile": config.PROFILE, "version": "0.2.0"}
 
 
 # ── Agent endpoints ───────────────────────────────────────────────────────────
 
 @app.post("/v1/agents/spawn")
 async def spawn_agent(body: dict):
-    """Spawn an agent by role and run it with a task."""
     role       = body.get("role", "coder")
     task       = body.get("task", "")
     session_id = body.get("session_id", str(uuid.uuid4()))
@@ -84,7 +98,6 @@ def list_skills():
 
 @app.post("/v1/skills/learn")
 async def learn_skill(body: dict):
-    """Extract and save a skill from a session transcript."""
     session_id = body.get("session_id", "default")
     transcript = body.get("transcript", [])
     if not transcript:
@@ -138,8 +151,7 @@ def agent_logs(agent_id: str):
 @app.post("/v1/index")
 async def index_codebase():
     log.info("indexing codebase at /workspace")
-    result = await memory.index_codebase("/workspace")
-    return result
+    return await memory.index_codebase("/workspace")
 
 
 @app.get("/v1/memory/recall")
@@ -162,7 +174,6 @@ async def save_memory(body: dict):
 
 @app.post("/v1/patches/submit")
 async def submit_patch(body: dict):
-    """Submit a unified diff to the patch queue."""
     diff        = body.get("diff", "")
     agent_id    = body.get("agent_id", "manual")
     task_id     = body.get("task_id", str(uuid.uuid4()))
@@ -179,7 +190,6 @@ async def submit_patch(body: dict):
 
 @app.post("/v1/patches/process")
 async def process_patches():
-    """Process all pending patches in the queue."""
     results = await patch_queue.process_all()
     return {"processed": len(results), "results": results}
 
@@ -194,29 +204,68 @@ def patches_list(session_id: str = None):
     return {"patches": patch_queue.list_patches(session_id)}
 
 
+# ── Step 2.2: Patch + test endpoint ──────────────────────────────────────────
+
+@app.post("/v1/patches/test")
+async def patch_and_test(body: dict):
+    """
+    Submit a diff, apply it, run pytest, and auto-fix failures up to
+    MAX_FIX_ATTEMPTS times.
+
+    Request body:
+        diff         string   required — unified diff
+        agent_id     string   optional
+        task_id      string   optional
+        session_id   string   optional
+        description  string   optional
+        test_pattern string   optional  default "tests/"
+
+    Response includes test_passed, attempts, test_summary in addition to
+    the standard patch fields.
+    """
+    diff         = body.get("diff", "")
+    agent_id     = body.get("agent_id", "manual")
+    task_id      = body.get("task_id", str(uuid.uuid4()))
+    session_id   = body.get("session_id", "default")
+    description  = body.get("description", "")
+    test_pattern = body.get("test_pattern", "tests/")
+
+    if not diff:
+        raise HTTPException(400, "diff is required")
+
+    try:
+        patch = await patch_queue.enqueue(diff, agent_id, task_id, session_id, description)
+    except PatchValidationError as e:
+        raise HTTPException(400, str(e))
+
+    mgr    = get_agent_manager()
+    result = await patch_queue.test_fix_loop(
+        patch=patch,
+        agent_mgr=mgr,
+        test_pattern=test_pattern,
+    )
+    return result
+
+
 # ── Task Queue (DAG) ──────────────────────────────────────────────────────────
 
 @app.post("/v1/tasks/load")
 async def load_tasks(body: dict):
-    """Load a task DAG for a session."""
     session_id = body.get("session_id", str(uuid.uuid4()))
     tasks      = body.get("tasks", [])
     if not tasks:
         raise HTTPException(400, "tasks list is required")
     try:
-        result = await task_queue.load_plan(session_id, tasks)
-        return result
+        return await task_queue.load_plan(session_id, tasks)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
 
 @app.post("/v1/tasks/execute")
 async def execute_tasks(body: dict):
-    """Execute all ready tasks in the DAG for a session."""
     session_id = body.get("session_id", "default")
     mgr        = get_agent_manager()
-    result     = await task_queue.execute_plan(session_id, mgr)
-    return result
+    return await task_queue.execute_plan(session_id, mgr)
 
 
 @app.get("/v1/tasks/status")
@@ -228,37 +277,43 @@ async def task_status(session_id: str = "default"):
 
 @app.post("/v1/agents/debate")
 async def debate(body: dict):
-    """Run a multi-round architect vs reviewer debate."""
     topic      = body.get("topic", "")
     session_id = body.get("session_id", str(uuid.uuid4()))
     max_rounds = body.get("max_rounds", config.MAX_DEBATE_ROUNDS)
     plan       = body.get("plan", "")
     if not topic:
         raise HTTPException(400, "topic is required")
-    result = await get_debate_engine().run(
+    return await get_debate_engine().run(
         topic=topic,
         session_id=session_id,
         initial_plan=plan,
         max_rounds=max_rounds,
     )
-    return result
 
 
-# ── Model list (Cline calls this on connect) ──────────────────────────────────
+# ── Step 2.3: Metrics endpoint ────────────────────────────────────────────────
+
+@app.get("/v1/metrics")
+def get_metrics(session_id: str = None):
+    """
+    Return aggregate metrics, optionally filtered to a single session.
+
+    Query params:
+        session_id   optional — if provided, returns only that session's metrics
+    """
+    if session_id:
+        return metrics.get_session_summary(session_id)
+    return metrics.get_summary()
+
+
+# ── Model list ────────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
 def list_models():
-    """Return a minimal model list so Cline's model picker works."""
     return {
         "object": "list",
-        "data": [
-            {
-                "id":       "orchestrator",
-                "object":   "model",
-                "created":  int(time.time()),
-                "owned_by": "local",
-            }
-        ],
+        "data": [{"id": "orchestrator", "object": "model",
+                  "created": int(time.time()), "owned_by": "local"}],
     }
 
 
@@ -266,7 +321,6 @@ def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    # Normalize Cline's list-format content blocks to plain strings
     messages = []
     for m in req.messages:
         d = m.model_dump(exclude_none=True)
@@ -277,13 +331,11 @@ async def chat_completions(req: ChatCompletionRequest):
             )
         messages.append(d)
 
-    # ── Command interception ──────────────────────────────────────────────────
     cmd = parse_command(messages)
     if cmd:
         response_text = await _handle_command(cmd, req)
         return JSONResponse(_make_response(response_text, "orchestrator"))
 
-    # ── Normal chat → model ───────────────────────────────────────────────────
     log.info("chat  messages=%d  stream=%s  profile=%s",
              len(req.messages), req.stream, config.PROFILE)
     try:
@@ -298,8 +350,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
 
 async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
-    """Dispatch a parsed /command and return a text response."""
-    sid = str(uuid.uuid4())   # session ID for this command invocation
+    sid = str(uuid.uuid4())
     mgr = get_agent_manager()
 
     if cmd.name == "architect":
@@ -308,9 +359,8 @@ async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
 
     elif cmd.name == "debate":
         r = await get_debate_engine().run(topic=cmd.args, session_id=sid)
-        rounds    = r.get("rounds", 0)
         consensus = "✅ Consensus reached" if r.get("consensus") else "⚠️ No consensus"
-        return f"**Debate Result** ({rounds} round(s), {consensus})\n\n{r.get('final_plan','')}"
+        return f"**Debate Result** ({r.get('rounds',0)} round(s), {consensus})\n\n{r.get('final_plan','')}"
 
     elif cmd.name == "review":
         r = await mgr.spawn_and_run(role="reviewer", task=cmd.args, session_id=sid)
@@ -339,16 +389,22 @@ async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
     elif cmd.name == "learn":
         msgs  = [m.model_dump(exclude_none=True) for m in req.messages]
         skill = await get_session_hooks().extract_skills(sid, msgs)
-        return f"✅ Skill extracted: **{skill}**" if skill else "No reusable skill identified in this session."
+        return f"✅ Skill extracted: **{skill}**" if skill else "No reusable skill identified."
 
     elif cmd.name == "status":
-        agent_s = get_agent_manager().get_status()
-        patch_s = patch_queue.queue_depth()
-        return (f"**System Status**\n"
-                f"- Agents: {agent_s['total']} total, {agent_s['running']} running, "
-                f"{agent_s['done']} done, {agent_s['failed']} failed\n"
-                f"- Patches: {patch_s['total']} total, {patch_s['pending']} pending, "
-                f"{patch_s['applied']} applied, {patch_s['rejected']} rejected")
+        agent_s   = get_agent_manager().get_status()
+        patch_s   = patch_queue.queue_depth()
+        metrics_s = metrics.get_summary()          # Step 2.3
+        return (
+            f"**System Status**\n"
+            f"- Agents: {agent_s['total']} total, {agent_s['running']} running, "
+            f"{agent_s['done']} done, {agent_s['failed']} failed\n"
+            f"- Patches: {patch_s['total']} total, {patch_s['pending']} pending, "
+            f"{patch_s['applied']} applied, {patch_s['rejected']} rejected\n"
+            f"- Metrics: {metrics_s['total_requests']} requests, "
+            f"{metrics_s['total_tokens_in']+metrics_s['total_tokens_out']} total tokens, "
+            f"avg latency {metrics_s['avg_latency_ms']}ms"
+        )
 
     elif cmd.name == "index":
         r = await memory.index_codebase("/workspace")
@@ -357,12 +413,11 @@ async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
                 f"- Chunks: {r['chunks']}\n"
                 f"- Skipped: {r['skipped']}")
 
-    else:  # unknown
+    else:
         return f"Unknown command: `{cmd.args}`\n\n{help_text()}"
 
 
 def _make_response(content: str, model: str) -> dict:
-    """Wrap a text string in an OpenAI-compatible chat completion response."""
     return {
         "id":      f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object":  "chat.completion",

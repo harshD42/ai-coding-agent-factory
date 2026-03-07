@@ -164,3 +164,63 @@ class TestExtractFilePaths:
         diff = "--- a/src/api/v1/auth.py\n+++ b/src/api/v1/auth.py\n@@ -1 +1 @@\n-x\n+y\n"
         paths = extract_file_paths_from_diff(diff)
         assert paths == ["src/api/v1/auth.py"]
+
+import pytest
+from utils import extract_diffs_from_result
+
+_SIMPLE = """\
+--- a/hello.py
++++ b/hello.py
+@@ -1,4 +1,8 @@
+ def hello():
+     return "hello"
++
++def multiply(a, b):
++    return a * b
+"""
+
+_DIFF_A = "--- a/foo.py\n+++ b/foo.py\n@@ -1,2 +1,3 @@\n x = 1\n+y = 2\n"
+_DIFF_B = "--- a/bar.py\n+++ b/bar.py\n@@ -1,1 +1,2 @@\n z = 0\n+w = 1\n"
+
+
+class TestExtractDiffsFromResult:
+    def test_single_fenced(self):
+        out = extract_diffs_from_result(f"```diff\n{_SIMPLE}\n```")
+        assert len(out) == 1 and "multiply" in out[0]
+
+    def test_patch_tag(self):
+        assert len(extract_diffs_from_result(f"```patch\n{_SIMPLE}\n```")) == 1
+
+    def test_udiff_tag(self):
+        assert len(extract_diffs_from_result(f"```udiff\n{_SIMPLE}\n```")) == 1
+
+    def test_case_insensitive(self):
+        assert len(extract_diffs_from_result(f"```DIFF\n{_SIMPLE}\n```")) == 1
+
+    def test_multiple_fenced(self):
+        txt = f"```diff\n{_DIFF_A}\n```\n```diff\n{_DIFF_B}\n```"
+        out = extract_diffs_from_result(txt)
+        assert len(out) == 2
+
+    def test_no_diffs(self):
+        assert extract_diffs_from_result("nothing here") == []
+
+    def test_block_without_hunk_skipped(self):
+        assert extract_diffs_from_result("```diff\nsome text\n```") == []
+
+    def test_deduplication(self):
+        txt = f"```diff\n{_SIMPLE}\n```\n```diff\n{_SIMPLE}\n```"
+        assert len(extract_diffs_from_result(txt)) == 1
+
+    def test_bare_diff_fallback(self):
+        out = extract_diffs_from_result(f"Changes:\n{_SIMPLE}\nDone.")
+        assert len(out) == 1 and "multiply" in out[0]
+
+    def test_empty_string(self):
+        assert extract_diffs_from_result("") == []
+
+    def test_fenced_wins_over_bare(self):
+        # When a fenced block exists, bare diff pass is skipped
+        txt = f"```diff\n{_SIMPLE}\n```\n{_SIMPLE}"
+        out = extract_diffs_from_result(txt)
+        assert len(out) == 1   # deduplication + fenced-first

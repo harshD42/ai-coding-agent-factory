@@ -265,3 +265,112 @@ class TestNormalizeDiff:
         cr = "--- a/f.py\r+++ b/f.py\r@@ -1 +1 @@\r-old\r+new\r"
         result = normalize_diff(cr)
         assert "\r" not in result
+
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch as mock_patch
+
+_SIMPLE_DIFF = """\
+--- a/hello.py
++++ b/hello.py
+@@ -1,4 +1,8 @@
+ def hello():
+     return "hello"
++
++def multiply(a, b):
++    return a * b
+"""
+
+class TestTestFixLoop:
+    """Tests for patch_queue.test_fix_loop() (Step 2.2)."""
+
+    def _make_patch(self, diff=None):
+        from patch_queue import Patch
+        d = diff or _SIMPLE_DIFF
+        p = Patch(diff=d, agent_id="a", task_id="t", session_id="s")
+        return p
+
+    def _make_pq(self):
+        from patch_queue import PatchQueue
+        pq = PatchQueue()
+        return pq
+
+    @pytest.mark.asyncio
+    async def test_pass_on_first_attempt(self):
+        pq    = self._make_pq()
+        patch = self._make_patch()
+        agent_mgr = MagicMock()
+
+        pq._apply_patch = AsyncMock(return_value={"action": "applied", **patch.to_dict()})
+        mock_tests = {"passed": True, "exit_code": 0, "stdout": "1 passed",
+                      "stderr": "", "summary": "1 passed"}
+
+        with mock_patch("executor_client.run_tests", AsyncMock(return_value=mock_tests)):
+            result = await pq.test_fix_loop(patch, agent_mgr, max_attempts=3)
+
+        assert result["test_passed"] is True
+        assert result["attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_apply_rejected_skips_tests(self):
+        pq    = self._make_pq()
+        patch = self._make_patch()
+        agent_mgr = MagicMock()
+
+        pq._apply_patch = AsyncMock(return_value={"action": "rejected", **patch.to_dict()})
+
+        with mock_patch("executor_client.run_tests", AsyncMock()) as mock_tests:
+            result = await pq.test_fix_loop(patch, agent_mgr, max_attempts=3)
+
+        mock_tests.assert_not_awaited()
+        assert result["test_passed"] is False
+
+    @pytest.mark.asyncio
+    async def test_fix_loop_retries(self):
+        pq    = self._make_pq()
+        patch = self._make_patch()
+
+        apply_results = [
+            {"action": "applied", **patch.to_dict()},
+            {"action": "applied", **patch.to_dict()},
+        ]
+        pq._apply_patch = AsyncMock(side_effect=apply_results)
+        pq.enqueue = AsyncMock(return_value=self._make_patch())
+
+        test_results = [
+            {"passed": False, "exit_code": 1, "stdout": "FAIL", "stderr": "err", "summary": "0 passed"},
+            {"passed": True,  "exit_code": 0, "stdout": "PASS", "stderr": "",    "summary": "1 passed"},
+        ]
+        agent_mgr = MagicMock()
+        agent_mgr.spawn_and_run = AsyncMock(return_value={
+            "result": f"```diff\n{_SIMPLE_DIFF}\n```",
+            "status": "done",
+        })
+
+        with mock_patch("executor_client.run_tests", AsyncMock(side_effect=test_results)):
+            result = await pq.test_fix_loop(patch, agent_mgr, max_attempts=3)
+
+        assert result["test_passed"] is True
+        assert result["attempts"] == 2
+
+    @pytest.mark.asyncio
+    async def test_exhausted_attempts_flags_review(self):
+        pq    = self._make_pq()
+        patch = self._make_patch()
+
+        pq._apply_patch = AsyncMock(return_value={"action": "applied", **patch.to_dict()})
+        pq.enqueue = AsyncMock(return_value=self._make_patch())
+
+        always_fail = {"passed": False, "exit_code": 1, "stdout": "", "stderr": "err", "summary": ""}
+        agent_mgr   = MagicMock()
+        agent_mgr.spawn_and_run = AsyncMock(return_value={
+            "result": f"```diff\n{_SIMPLE_DIFF}\n```",
+            "status": "done",
+        })
+
+        with mock_patch("executor_client.run_tests", AsyncMock(return_value=always_fail)):
+            result = await pq.test_fix_loop(patch, agent_mgr, max_attempts=2)
+
+        assert result["test_passed"] is False
+        assert result["action"] == "needs_review"
+        assert result["attempts"] == 2

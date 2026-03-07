@@ -5,6 +5,8 @@ pydantic==2.9.2
 python-dotenv==1.0.1
 chromadb==0.6.3
 redis==5.2.1
+python-dotenv
+watchdog==4.0.0
 
 # Testing (also used by CI inside the container)
 pytest==8.2.2

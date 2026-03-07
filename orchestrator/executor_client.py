@@ -21,7 +21,7 @@ async def execute(command: str, timeout: int = None, cwd: str = None) -> dict:
     Run an allowed command in the workspace sandbox.
     Returns {"stdout": ..., "stderr": ..., "exit_code": ...}
     """
-    body = {"command": command}
+    body: dict = {"command": command}
     if timeout is not None:
         body["timeout"] = timeout
     if cwd is not None:
@@ -80,3 +80,57 @@ async def health() -> bool:
         return resp.status_code == 200
     except Exception:
         return False
+
+
+# ── Step 2.2: Test runner ─────────────────────────────────────────────────────
+
+async def run_tests(pattern: str = "tests/", timeout: int = 120) -> dict:
+    """
+    Run pytest inside the executor sandbox.
+
+    Calls POST /execute with:  pytest {pattern} -v --tb=short --no-header
+
+    Returns a normalized result dict:
+        {
+            "passed":    bool,     # True only if exit_code == 0
+            "exit_code": int,
+            "stdout":    str,
+            "stderr":    str,
+            "summary":   str,      # last non-empty stdout line (pytest summary line)
+        }
+
+    Never raises — errors are returned as {"passed": False, "error": str, ...}
+    so the caller can always inspect the result without a try/except.
+    """
+    command = f"pytest {pattern} -v --tb=short --no-header"
+    log.info("run_tests: %s (timeout=%ds)", command, timeout)
+    try:
+        result = await execute(command=command, timeout=timeout)
+        stdout    = result.get("stdout", "")
+        stderr    = result.get("stderr", "")
+        exit_code = result.get("exit_code", -1)
+
+        # Extract pytest's summary line (last non-blank line of stdout)
+        lines   = [l for l in stdout.splitlines() if l.strip()]
+        summary = lines[-1] if lines else ""
+
+        passed = (exit_code == 0)
+        log.info("run_tests: exit_code=%d  passed=%s  summary=%r",
+                 exit_code, passed, summary)
+        return {
+            "passed":    passed,
+            "exit_code": exit_code,
+            "stdout":    stdout,
+            "stderr":    stderr,
+            "summary":   summary,
+        }
+    except Exception as exc:
+        log.error("run_tests error: %s", exc)
+        return {
+            "passed":    False,
+            "exit_code": -1,
+            "stdout":    "",
+            "stderr":    "",
+            "summary":   "",
+            "error":     str(exc),
+        }
