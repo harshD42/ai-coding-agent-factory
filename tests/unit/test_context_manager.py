@@ -196,9 +196,9 @@ class TestCountMessagesTokens:
         assert tokens > 0
 
     def test_overhead_per_message(self):
-        # Each message adds 4 overhead tokens
+        # Each message: count_tokens("") == 1 (minimum) + 4 overhead = 5
         msgs = [{"role": "user", "content": ""}] * 5
-        assert count_messages_tokens(msgs) == 5 * 4  # 4 overhead each, empty content
+        assert count_messages_tokens(msgs) == 5 * 5  # 5 per empty message
 
 
 class TestSanitizeContext:

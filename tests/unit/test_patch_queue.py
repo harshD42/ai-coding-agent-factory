@@ -135,10 +135,13 @@ class TestPatch:
         d = p.to_dict()
         assert "hello.py" in d["files"]
 
-    def test_diff_normalized_on_creation(self):
+    def test_normalize_diff_strips_crlf(self):
+        # normalize_diff() is called in enqueue(), not in Patch.__init__
+        # Test the function directly
         crlf_diff = VALID_DIFF.replace("\n", "\r\n")
-        p = Patch(crlf_diff, "a", "t", "s")
-        assert "\r" not in p.diff
+        result = normalize_diff(crlf_diff)
+        assert "\r" not in result
+        assert result == VALID_DIFF
 
 
 class TestPatchQueueLogic:
