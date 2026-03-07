@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+# gcc needed to compile tree-sitter C extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.txt .

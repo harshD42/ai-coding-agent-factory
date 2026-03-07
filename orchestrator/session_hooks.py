@@ -1,11 +1,12 @@
 """
 session_hooks.py — Lifecycle hooks for sessions.
 
-Hooks:
-    on_session_start  — load relevant past context from ChromaDB
-    on_session_end    — save session, extract skills, record any failures
-    on_failure        — record a failure to the failures collection
-    extract_skills    — ask the model what reusable patterns emerged
+Phase 3 additions:
+  3.4  on_session_end() now calls _mine_failure_patterns() after saving.
+       If >= N_FAILURES_THRESHOLD similar failures exist, the model is asked
+       to produce an anti-pattern skill which is saved to ChromaDB with
+       metadata type=antipattern.
+  3.2  record_training_example() called when a patch is applied + tests pass.
 """
 
 import logging
@@ -17,6 +18,7 @@ import httpx
 
 import config
 from memory_manager import MemoryManager
+from fine_tune_collector import record_success as ft_record   # Step 3.2
 
 log = logging.getLogger("session_hooks")
 
@@ -30,15 +32,10 @@ class SessionHooks:
     # ── on_session_start ──────────────────────────────────────────────────────
 
     async def on_session_start(self, session_id: str, task: str = "") -> dict:
-        """
-        Called when a new session begins.
-        Returns relevant past context to seed the session.
-        """
         past = []
         if task:
             past = await self._mem.recall(task, k=3)
-
-        log.info("session_start  id=%s  past_context=%d items", session_id, len(past))
+        log.info("session_start  id=%s  past_context=%d", session_id, len(past))
         return {
             "session_id":   session_id,
             "past_context": past,
@@ -50,22 +47,16 @@ class SessionHooks:
     async def on_session_end(
         self,
         session_id: str,
-        summary: str,
+        summary:    str,
         transcript: list[dict] = None,
-        failures: list[dict]   = None,
+        failures:   list[dict] = None,
     ) -> dict:
-        """
-        Called when a session ends.
-        Saves the session summary, records failures, and attempts skill extraction.
-        """
-        # Save session summary
         await self._mem.save_session(
             session_id=session_id,
             content=summary,
             metadata={"ts": int(time.time()), "type": "session_end"},
         )
 
-        # Record any failures
         for f in (failures or []):
             await self._mem.record_failure(
                 session_id=session_id,
@@ -75,30 +66,37 @@ class SessionHooks:
                 approach=f.get("approach", ""),
             )
 
-        # Extract skills from the transcript
-        skill = None
+        skill         = None
+        antipattern   = None
+
         if transcript:
             skill = await self.extract_skills(session_id, transcript)
 
-        log.info("session_end  id=%s  skill_extracted=%s", session_id, skill is not None)
+        # Step 3.4: mine failure patterns after recording failures
+        if failures:
+            antipattern = await self._mine_failure_patterns(session_id, summary)
+
+        log.info("session_end  id=%s  skill=%s  antipattern=%s",
+                 session_id, skill, antipattern)
         return {
-            "session_id":      session_id,
-            "saved":           True,
-            "skill_extracted": skill is not None,
-            "skill_name":      skill,
+            "session_id":         session_id,
+            "saved":              True,
+            "skill_extracted":    skill is not None,
+            "skill_name":         skill,
+            "antipattern_mined":  antipattern is not None,
+            "antipattern_name":   antipattern,
         }
 
     # ── on_failure ────────────────────────────────────────────────────────────
 
     async def on_failure(
         self,
-        session_id: str,
-        task_id: str,
+        session_id:  str,
+        task_id:     str,
         description: str,
-        error: str,
-        approach: str = "",
+        error:       str,
+        approach:    str = "",
     ) -> None:
-        """Record a failure immediately (not waiting for session end)."""
         await self._mem.record_failure(
             session_id=session_id,
             task_id=task_id,
@@ -108,22 +106,42 @@ class SessionHooks:
         )
         log.info("on_failure recorded  session=%s  task=%s", session_id, task_id)
 
+    # ── Step 3.2: Training data recording ─────────────────────────────────────
+
+    async def record_training_example(
+        self,
+        session_id:  str,
+        agent_id:    str,
+        task:        str,
+        diff:        str,
+        context:     str = "",
+        tokens_in:   int = 0,
+        tokens_out:  int = 0,
+    ) -> bool:
+        """
+        Called by patch_queue.test_fix_loop() when a patch applies AND
+        tests pass — records the (task, diff) pair for fine-tuning.
+        """
+        return await ft_record(
+            session_id=session_id,
+            agent_id=agent_id,
+            task=task,
+            diff=diff,
+            context=context,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+
     # ── extract_skills ────────────────────────────────────────────────────────
 
     async def extract_skills(
         self, session_id: str, transcript: list[dict]
     ) -> Optional[str]:
-        """
-        Ask the model if any reusable patterns emerged from this session.
-        If yes, saves to the skills collection and returns the skill name.
-        Returns None if no skill was identified.
-        """
         if not transcript:
             return None
 
-        # Build a condensed transcript for the model
         lines = []
-        for t in transcript[-10:]:   # last 10 entries to stay within context
+        for t in transcript[-10:]:
             role    = t.get("role", "unknown")
             content = str(t.get("content", ""))[:300]
             lines.append(f"{role.upper()}: {content}")
@@ -155,7 +173,6 @@ class SessionHooks:
             if "NO_SKILL" in text.upper():
                 return None
 
-            # Parse skill name and content
             skill_name    = _parse_field(text, "SKILL_NAME")
             skill_content = _parse_field(text, "SKILL_CONTENT")
 
@@ -166,6 +183,83 @@ class SessionHooks:
 
         except Exception as e:
             log.warning("skill extraction failed: %s", e)
+        return None
+
+    # ── Step 3.4: Failure pattern mining ─────────────────────────────────────
+
+    async def _mine_failure_patterns(
+        self, session_id: str, context: str = ""
+    ) -> Optional[str]:
+        """
+        Check if enough similar failures have accumulated to extract an
+        anti-pattern skill.
+
+        Flow:
+          1. cluster_failures() groups recent failures semantically.
+          2. For each cluster >= N_FAILURES_THRESHOLD, ask the model to
+             describe what NOT to do.
+          3. Save as a skill with type=antipattern.
+          4. Return the first new anti-pattern name, or None.
+        """
+        threshold = config.N_FAILURES_THRESHOLD
+        try:
+            clusters = await self._mem.cluster_failures(
+                query=context or "error failure", k=30
+            )
+        except Exception as e:
+            log.warning("_mine_failure_patterns: cluster_failures failed: %s", e)
+            return None
+
+        for cluster in clusters:
+            if len(cluster) < threshold:
+                continue
+
+            # Build a summary of the cluster for the model
+            examples = "\n\n".join(
+                f"Failure {i+1}:\n{f['content'][:400]}"
+                for i, f in enumerate(cluster[:5])
+            )
+
+            prompt = (
+                f"The following {len(cluster)} similar failures have occurred repeatedly.\n"
+                "Identify the common anti-pattern and describe what to AVOID in future.\n\n"
+                "Respond with:\n"
+                "ANTIPATTERN_NAME: <short name>\n"
+                "ANTIPATTERN_CONTENT: <what to avoid and why, 2-5 sentences>\n\n"
+                "If these failures don't share a clear pattern, respond: NO_PATTERN\n\n"
+                f"Examples:\n{examples}"
+            )
+
+            try:
+                resp = await _http.post(
+                    f"{config.OLLAMA_URL}/api/chat",
+                    json={
+                        "model":    config.OLLAMA_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream":   False,
+                        "options":  {"num_predict": 256},
+                    },
+                )
+                resp.raise_for_status()
+                text = resp.json().get("message", {}).get("content", "")
+
+                if "NO_PATTERN" in text.upper():
+                    continue
+
+                ap_name    = _parse_field(text, "ANTIPATTERN_NAME")
+                ap_content = _parse_field(text, "ANTIPATTERN_CONTENT")
+
+                if ap_name and ap_content:
+                    await self._mem.save_skill(
+                        name=f"antipattern:{ap_name}",
+                        content=ap_content,
+                        metadata={"type": "antipattern", "cluster_size": len(cluster)},
+                    )
+                    log.info("antipattern mined: %s (cluster_size=%d)", ap_name, len(cluster))
+                    return ap_name
+
+            except Exception as e:
+                log.warning("_mine_failure_patterns: model call failed: %s", e)
 
         return None
 
@@ -173,7 +267,6 @@ class SessionHooks:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_field(text: str, field: str) -> str:
-    """Extract 'FIELD_NAME: value' from model output."""
     for line in text.splitlines():
         if line.strip().upper().startswith(f"{field}:"):
             return line.split(":", 1)[1].strip()

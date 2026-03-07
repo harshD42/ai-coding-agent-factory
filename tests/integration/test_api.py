@@ -60,8 +60,10 @@ class TestExecutorHealth:
         assert r.status_code == 200
         assert "files" in r.json()
 
+
     def test_execute_allowed_command(self, client):
-        r = client.post(f"{EXECUTOR_URL}/execute", json={"command": "echo hello"})
+        # Use 'sh' which is in the whitelist — 'echo' alone is not
+        r = client.post(f"{EXECUTOR_URL}/execute", json={"command": "sh -c 'echo hello'"})
         assert r.status_code == 200
         data = r.json()
         assert data["exit_code"] == 0
@@ -77,11 +79,16 @@ class TestExecutorHealth:
         assert r.status_code == 400
 
     def test_patch_validation_bad_diff(self, client):
+        # The executor's /apply-patch does basic size/binary checks only.
+        # Structural diff validation (hunk headers etc) lives in the orchestrator's
+        # patch_queue.validate_patch(). A non-diff string passes HTTP validation
+        # but git apply rejects it — response is 200 with applied=false.
         r = client.post(
             f"{EXECUTOR_URL}/apply-patch",
             json={"diff": "this is not a diff", "target": "sandbox"}
         )
-        assert r.status_code == 400
+        assert r.status_code == 200
+        assert r.json()["applied"] is False
 
     def test_patch_sandbox_valid_diff(self, client):
         diff = (

@@ -58,9 +58,9 @@ else:  # gpu
 FALLBACK_ORDER = [CODER_URL, ARCHITECT_URL, REVIEWER_URL, OLLAMA_URL]
 
 # ── Orchestrator config ───────────────────────────────────────────────────────
-MAX_CONTEXT_TOKENS = int(os.environ.get("MAX_CONTEXT_TOKENS", "24000"))
-MAX_DEBATE_ROUNDS  = int(os.environ.get("MAX_DEBATE_ROUNDS",  "3"))
-MAX_AGENT_RUNTIME  = int(os.environ.get("MAX_AGENT_RUNTIME",  "300"))
+MAX_CONTEXT_TOKENS  = int(os.environ.get("MAX_CONTEXT_TOKENS",  "24000"))
+MAX_DEBATE_ROUNDS   = int(os.environ.get("MAX_DEBATE_ROUNDS",   "3"))
+MAX_AGENT_RUNTIME   = int(os.environ.get("MAX_AGENT_RUNTIME",   "300"))
 
 # ── Infrastructure URLs ───────────────────────────────────────────────────────
 REDIS_URL    = os.environ.get("REDIS_URL",    "redis://redis:6379")
@@ -70,8 +70,18 @@ EXECUTOR_URL = os.environ.get("EXECUTOR_URL", "http://executor:9001")
 # ── Embedding ─────────────────────────────────────────────────────────────────
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 
-# ── Step 2.1: Auto-patch fix-loop limit ──────────────────────────────────────
-MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "3"))
-
-# ── Step 2.6: Parallel agent cap ─────────────────────────────────────────────
+# ── Phase 2 ───────────────────────────────────────────────────────────────────
+MAX_FIX_ATTEMPTS    = int(os.environ.get("MAX_FIX_ATTEMPTS",    "3"))
 MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "3"))
+
+# ── Phase 3.3: GitHub webhook ─────────────────────────────────────────────────
+GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+GITHUB_TOKEN          = os.environ.get("GITHUB_TOKEN",          "")
+GITHUB_REPO           = os.environ.get("GITHUB_REPO",           "")
+
+# ── Phase 3.4: Failure pattern learning ──────────────────────────────────────
+# Number of similar failures before auto-extracting an anti-pattern skill
+N_FAILURES_THRESHOLD = int(os.environ.get("N_FAILURES_THRESHOLD", "3"))
+
+# ── Phase 3.2: Fine-tune data collection ─────────────────────────────────────
+TRAINING_DATA_PATH = os.environ.get("TRAINING_DATA_PATH", "/app/memory/training_data.jsonl")

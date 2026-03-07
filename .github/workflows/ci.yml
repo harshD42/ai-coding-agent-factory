@@ -36,7 +36,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install system dependencies
+        run: sudo apt-get install -y gcc
+
+      - name: Install Python dependencies
         run: |
           pip install \
             pytest==8.2.2 \
@@ -47,7 +50,17 @@ jobs:
             fastapi==0.115.0 \
             chromadb==0.6.3 \
             redis==5.2.1 \
-            python-dotenv==1.0.1
+            python-dotenv==1.0.1 \
+            watchdog==4.0.0 \
+            tree-sitter==0.23.2 \
+            tree-sitter-python==0.23.6 \
+            tree-sitter-javascript==0.23.1 \
+            tree-sitter-typescript==0.23.2 \
+            tree-sitter-go==0.23.4 \
+            tree-sitter-rust==0.23.2 \
+            tree-sitter-java==0.23.5 \
+            tree-sitter-c==0.23.4 \
+            tree-sitter-cpp==0.23.4
 
       - name: Run unit tests
         run: pytest tests/unit/ -v --tb=short --asyncio-mode=auto
@@ -154,7 +167,7 @@ jobs:
           except Exception as e:
               failures.append(f"FAIL health: {e}")
 
-          # Allowed command (use 'sh' which is in the whitelist)
+          # Allowed command
           status, body = post("/execute", {"command": "sh -c 'echo hello'", "timeout": 10})
           if status == 200 and body.get("exit_code") == 0:
               print("PASS: allowed command executes")
@@ -181,6 +194,13 @@ jobs:
               print("PASS: list files works")
           else:
               failures.append(f"FAIL list-files: status={status} body={body}")
+
+          # pytest is available in executor (Phase 2.2)
+          status, body = post("/execute", {"command": "pytest --version", "timeout": 15})
+          if status == 200 and body.get("exit_code") == 0:
+              print("PASS: pytest available in executor")
+          else:
+              failures.append(f"FAIL pytest: status={status} body={body}")
 
           if failures:
               print("\nFAILURES:")

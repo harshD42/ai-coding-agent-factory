@@ -101,7 +101,7 @@ Load a task DAG for a session. Validates for cycles and missing dependencies.
 
 ### POST /v1/tasks/execute
 
-Execute all ready tasks in dependency order.
+Execute all ready tasks in dependency order. Independent tasks run concurrently (Phase 2.6).
 
 ```json
 {"session_id": "my-session"}
@@ -109,7 +109,11 @@ Execute all ready tasks in dependency order.
 
 **Response:**
 ```json
-{"executed": 2, "complete": 2, "failed": 0, "blocked": 0, "remaining": 0}
+{
+  "executed": 2, "complete": 2, "failed": 0,
+  "blocked": 0, "remaining": 0,
+  "tasks": [{"id": "t1", "status": "complete", "patches_applied": 1, "patches_failed": 0}]
+}
 ```
 
 ### GET /v1/tasks/status?session_id=my-session
@@ -124,7 +128,7 @@ Execute all ready tasks in dependency order.
 
 ### POST /v1/index
 
-Re-index the project workspace into ChromaDB.
+Re-index the project workspace into ChromaDB using AST-aware chunking (Phase 3.1). Python, JS, TS, Go, Rust, Java, C, C++ files are indexed at function/class boundaries. All other supported types use line-based chunking.
 
 ```json
 {"files_indexed": 42, "chunks": 187, "skipped": 3}
@@ -132,11 +136,37 @@ Re-index the project workspace into ChromaDB.
 
 ### GET /v1/memory/recall?q=rate+limiter
 
-Semantic search over past sessions and failures.
+Semantic search over past sessions and failures, with reranking (Phase 2.5).
 
 ```json
 {"query": "rate limiter", "results": [{"content": "...", "distance": 1.2, "collection": "sessions"}]}
 ```
+
+### GET /v1/memory/symbol?name=multiply&k=5
+
+**Phase 3.1** — Search the indexed codebase for a function or class by name. Returns AST-enriched chunks with symbol metadata.
+
+```json
+{
+  "query": "multiply",
+  "count": 1,
+  "results": [{
+    "content": "def multiply(a, b):\n    return a * b\n",
+    "metadata": {
+      "file": "hello.py",
+      "symbol": "multiply",
+      "symbol_type": "function",
+      "start_line": 4,
+      "end_line": 5,
+      "language": "python"
+    },
+    "distance": 0.0,
+    "collection": "codebase"
+  }]
+}
+```
+
+**Query params:** `name` (required), `k` (optional, default 5)
 
 ### POST /v1/memory/save
 
@@ -162,6 +192,20 @@ Submit a unified diff for validation and queuing.
 
 Process all pending patches (validate → sandbox → apply).
 
+### POST /v1/patches/test
+
+**Phase 2.2** — Submit a diff, apply it, run pytest, and auto-fix failures up to `MAX_FIX_ATTEMPTS` times.
+
+```json
+{
+  "diff": "--- a/f.py\n+++ b/f.py\n@@ ...",
+  "session_id": "s1",
+  "test_pattern": "tests/"
+}
+```
+
+**Response includes:** `test_passed`, `attempts`, `test_summary` in addition to standard patch fields.
+
 ### GET /v1/patches/status
 
 ```json
@@ -169,6 +213,97 @@ Process all pending patches (validate → sandbox → apply).
 ```
 
 ### GET /v1/patches/list?session_id=s1
+
+---
+
+## Metrics
+
+### GET /v1/metrics
+
+**Phase 2.3** — Return aggregate token counts and latency across all agent calls.
+
+```json
+{
+  "total_requests": 12,
+  "total_tokens_in": 18400,
+  "total_tokens_out": 5600,
+  "avg_latency_ms": 1840.5,
+  "by_role": {
+    "coder": {"requests": 8, "tokens_in": 12000, "tokens_out": 4000, "avg_latency_ms": 1900.0},
+    "architect": {"requests": 4, "tokens_in": 6400, "tokens_out": 1600, "avg_latency_ms": 1720.0}
+  }
+}
+```
+
+**Query params:** `session_id` (optional) — filter to a single session.
+
+---
+
+## Fine-tune Data
+
+### GET /v1/finetune/stats
+
+**Phase 3.2** — Return stats about collected training examples.
+
+```json
+{"records": 42, "size_bytes": 186320, "path": "/app/memory/training_data.jsonl"}
+```
+
+### GET /v1/finetune/export?limit=100
+
+**Phase 3.2** — Download training data as JSONL (Alpaca format). Each line: `{instruction, input, output, metadata}`.
+
+**Query params:** `limit` (optional) — cap number of records.
+
+Returns `Content-Type: application/x-ndjson` with `Content-Disposition: attachment`.
+
+### DELETE /v1/finetune/clear
+
+**Phase 3.2** — Delete all collected training records.
+
+```json
+{"deleted": 42}
+```
+
+---
+
+## Webhook
+
+### POST /v1/webhook/github
+
+**Phase 3.3** — Receive GitHub webhook events. Requires `X-Hub-Signature-256` header signed with `GITHUB_WEBHOOK_SECRET`.
+
+**Supported events:**
+
+| Event | Trigger | Action |
+|-------|---------|--------|
+| `workflow_run` | CI fails | Coder agent analyzes logs → proposes fix diff → enqueues patch |
+| `issues` | Issue opened | Architect decomposes issue → loads task DAG |
+
+**Setup:** In your GitHub repo → Settings → Webhooks → add `http://your-server:9000/v1/webhook/github`, content type `application/json`, set a secret matching `GITHUB_WEBHOOK_SECRET`.
+
+**Response (workflow_run):**
+```json
+{
+  "event": "workflow_run",
+  "run_id": 12345,
+  "session_id": "ci-fix-12345",
+  "diffs_found": 1,
+  "enqueued": 1,
+  "agent_status": "done"
+}
+```
+
+**Response (issues):**
+```json
+{
+  "event": "issues",
+  "issue_number": 42,
+  "session_id": "issue-42",
+  "tasks_loaded": 3,
+  "plan_preview": "..."
+}
+```
 
 ---
 
@@ -204,6 +339,8 @@ Returns relevant past context for the session.
 {"session_id": "s1", "summary": "Built rate limiter", "transcript": [...], "failures": [...]}
 ```
 
+**Phase 3.4:** If `failures` are provided and similar failures exist in ChromaDB above the threshold, an anti-pattern skill is automatically extracted and saved.
+
 ---
 
 ## Health
@@ -211,7 +348,7 @@ Returns relevant past context for the session.
 ### GET /health
 
 ```json
-{"status": "ok", "profile": "laptop", "version": "0.6.0"}
+{"status": "ok", "profile": "laptop", "version": "0.3.0"}
 ```
 
 ---
@@ -229,5 +366,5 @@ Commands are detected in the last user message sent to `/v1/chat/completions`.
 | `/execute` | none | Execute current task queue |
 | `/memory <query>` | required | Search past sessions |
 | `/learn` | none | Extract skill from session |
-| `/status` | none | System health summary |
-| `/index` | none | Re-index codebase |
+| `/status` | none | System health + metrics + training data count |
+| `/index` | none | Re-index codebase (AST-aware) |

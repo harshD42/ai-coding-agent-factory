@@ -1,36 +1,43 @@
 """
 main.py — Orchestrator entry point.
 
-Phase 2 additions:
-  Step 2.1  task_queue.set_patch_queue() wired in lifespan
-  Step 2.2  POST /v1/patches/test   — apply patch + run test-fix loop
-  Step 2.3  GET  /v1/metrics        — aggregate token / latency metrics
-            /status command updated to include metrics summary
-  Step 2.4  file_watcher.start()    — real-time workspace hash registry
+Phase 3 additions:
+  3.1  GET  /v1/memory/symbol       — search codebase by symbol name
+  3.2  GET  /v1/finetune/export     — download training data JSONL
+       GET  /v1/finetune/stats      — training data stats
+       DELETE /v1/finetune/clear    — clear training data
+  3.3  POST /v1/webhook/github      — GitHub CI/issue webhook receiver
 """
 
+import hashlib
+import hmac
 import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 
 import config
 import router
 from agent_manager import init_agent_manager, get_agent_manager
 from command_parser import parse as parse_command, help_text
 from debate_engine import init_debate_engine, get_debate_engine
-from file_watcher import file_watcher                          # Step 2.4
+from file_watcher import file_watcher
+from fine_tune_collector import get_stats, read_records, clear_records  # Step 3.2
 from memory_manager import memory
-from metrics import metrics                                    # Step 2.3
+from metrics import metrics
 from models import ChatCompletionRequest
 from patch_queue import patch_queue, PatchValidationError
 from session_hooks import init_session_hooks, get_session_hooks
 from skill_loader import skill_loader
 from task_queue import task_queue
+from webhook_handler import (                                            # Step 3.3
+    verify_signature, WebhookSignatureError,
+    handle_workflow_run, handle_issue_opened,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,35 +51,27 @@ async def lifespan(app: FastAPI):
     log.info("connecting to ChromaDB and Redis...")
     await memory.connect()
     await task_queue.connect()
-
-    # Step 2.1 — wire patch_queue into task_queue so diffs are auto-applied
     task_queue.set_patch_queue(patch_queue)
-
     mgr = init_agent_manager(memory)
     init_debate_engine(mgr)
     init_session_hooks(memory)
     skill_loader.load()
-
-    # Step 2.4 — start file watcher (uses task_queue's Redis connection)
     await file_watcher.start(task_queue._redis)
-
     log.info("all systems ready")
     yield
-
-    # Shutdown
-    await file_watcher.stop()                                  # Step 2.4
+    await file_watcher.stop()
     await memory.close()
     await task_queue.close()
 
 
-app = FastAPI(title="AI Coding Agent Orchestrator", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="AI Coding Agent Orchestrator", version="0.3.0", lifespan=lifespan)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "profile": config.PROFILE, "version": "0.2.0"}
+    return {"status": "ok", "profile": config.PROFILE, "version": "0.3.0"}
 
 
 # ── Agent endpoints ───────────────────────────────────────────────────────────
@@ -84,9 +83,25 @@ async def spawn_agent(body: dict):
     session_id = body.get("session_id", str(uuid.uuid4()))
     if not task:
         raise HTTPException(400, "task is required")
-    mgr    = get_agent_manager()
-    result = await mgr.spawn_and_run(role=role, task=task, session_id=session_id)
-    return result
+    return await get_agent_manager().spawn_and_run(role=role, task=task, session_id=session_id)
+
+
+@app.get("/v1/agents/status")
+def agent_status():
+    return get_agent_manager().get_status()
+
+
+@app.get("/v1/agents/list")
+def agent_list():
+    return {"agents": get_agent_manager().list_agents()}
+
+
+@app.get("/v1/agents/{agent_id}/logs")
+def agent_logs(agent_id: str):
+    agent = get_agent_manager().get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, f"Agent {agent_id!r} not found")
+    return agent.to_dict()
 
 
 # ── Skills ────────────────────────────────────────────────────────────────────
@@ -128,24 +143,6 @@ async def session_end(body: dict):
     )
 
 
-@app.get("/v1/agents/status")
-def agent_status():
-    return get_agent_manager().get_status()
-
-
-@app.get("/v1/agents/list")
-def agent_list():
-    return {"agents": get_agent_manager().list_agents()}
-
-
-@app.get("/v1/agents/{agent_id}/logs")
-def agent_logs(agent_id: str):
-    agent = get_agent_manager().get_agent(agent_id)
-    if not agent:
-        raise HTTPException(404, f"Agent {agent_id!r} not found")
-    return agent.to_dict()
-
-
 # ── Memory & Indexing ─────────────────────────────────────────────────────────
 
 @app.post("/v1/index")
@@ -168,6 +165,25 @@ async def save_memory(body: dict):
         raise HTTPException(400, "content is required")
     await memory.save_session(session_id, content, body.get("metadata", {}))
     return {"saved": True, "session_id": session_id}
+
+
+# ── Step 3.1: Symbol search ───────────────────────────────────────────────────
+
+@app.get("/v1/memory/symbol")
+async def symbol_search(name: str = Query(...), k: int = 5):
+    """
+    Search the indexed codebase for a function or class by name.
+
+    Query params:
+        name   required — symbol name (exact or partial)
+        k      optional — max results (default 5)
+
+    Returns chunks with symbol, symbol_type, start_line, end_line metadata.
+    """
+    if not name:
+        raise HTTPException(400, "name is required")
+    results = await memory.search_symbol(name, k=k)
+    return {"query": name, "results": results, "count": len(results)}
 
 
 # ── Patch Queue ───────────────────────────────────────────────────────────────
@@ -204,50 +220,26 @@ def patches_list(session_id: str = None):
     return {"patches": patch_queue.list_patches(session_id)}
 
 
-# ── Step 2.2: Patch + test endpoint ──────────────────────────────────────────
-
 @app.post("/v1/patches/test")
 async def patch_and_test(body: dict):
-    """
-    Submit a diff, apply it, run pytest, and auto-fix failures up to
-    MAX_FIX_ATTEMPTS times.
-
-    Request body:
-        diff         string   required — unified diff
-        agent_id     string   optional
-        task_id      string   optional
-        session_id   string   optional
-        description  string   optional
-        test_pattern string   optional  default "tests/"
-
-    Response includes test_passed, attempts, test_summary in addition to
-    the standard patch fields.
-    """
     diff         = body.get("diff", "")
     agent_id     = body.get("agent_id", "manual")
     task_id      = body.get("task_id", str(uuid.uuid4()))
     session_id   = body.get("session_id", "default")
     description  = body.get("description", "")
     test_pattern = body.get("test_pattern", "tests/")
-
     if not diff:
         raise HTTPException(400, "diff is required")
-
     try:
         patch = await patch_queue.enqueue(diff, agent_id, task_id, session_id, description)
     except PatchValidationError as e:
         raise HTTPException(400, str(e))
-
-    mgr    = get_agent_manager()
-    result = await patch_queue.test_fix_loop(
-        patch=patch,
-        agent_mgr=mgr,
-        test_pattern=test_pattern,
+    return await patch_queue.test_fix_loop(
+        patch=patch, agent_mgr=get_agent_manager(), test_pattern=test_pattern
     )
-    return result
 
 
-# ── Task Queue (DAG) ──────────────────────────────────────────────────────────
+# ── Task Queue ────────────────────────────────────────────────────────────────
 
 @app.post("/v1/tasks/load")
 async def load_tasks(body: dict):
@@ -264,8 +256,7 @@ async def load_tasks(body: dict):
 @app.post("/v1/tasks/execute")
 async def execute_tasks(body: dict):
     session_id = body.get("session_id", "default")
-    mgr        = get_agent_manager()
-    return await task_queue.execute_plan(session_id, mgr)
+    return await task_queue.execute_plan(session_id, get_agent_manager())
 
 
 @app.get("/v1/tasks/status")
@@ -284,26 +275,97 @@ async def debate(body: dict):
     if not topic:
         raise HTTPException(400, "topic is required")
     return await get_debate_engine().run(
-        topic=topic,
-        session_id=session_id,
-        initial_plan=plan,
-        max_rounds=max_rounds,
+        topic=topic, session_id=session_id, initial_plan=plan, max_rounds=max_rounds,
     )
 
 
-# ── Step 2.3: Metrics endpoint ────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
 
 @app.get("/v1/metrics")
 def get_metrics(session_id: str = None):
-    """
-    Return aggregate metrics, optionally filtered to a single session.
-
-    Query params:
-        session_id   optional — if provided, returns only that session's metrics
-    """
     if session_id:
         return metrics.get_session_summary(session_id)
     return metrics.get_summary()
+
+
+# ── Step 3.2: Fine-tune data endpoints ───────────────────────────────────────
+
+@app.get("/v1/finetune/stats")
+def finetune_stats():
+    """Return stats about collected training data."""
+    return get_stats()
+
+
+@app.get("/v1/finetune/export")
+def finetune_export(limit: int = None):
+    """
+    Download training data as JSONL.
+    Each line is a JSON object: {instruction, input, output, metadata}.
+
+    Query params:
+        limit   optional — cap number of records returned
+    """
+    import json
+    records = read_records(limit=limit)
+    if not records:
+        return PlainTextResponse("", media_type="application/x-ndjson")
+    content = "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n"
+    return PlainTextResponse(
+        content,
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": "attachment; filename=training_data.jsonl"},
+    )
+
+
+@app.delete("/v1/finetune/clear")
+def finetune_clear():
+    """Delete all collected training records."""
+    count = clear_records()
+    return {"deleted": count}
+
+
+# ── Step 3.3: GitHub webhook ──────────────────────────────────────────────────
+
+@app.post("/v1/webhook/github")
+async def github_webhook(request: Request):
+    """
+    Receive GitHub webhook events.
+
+    Supported events:
+        workflow_run  — failed CI triggers coder agent + patch enqueue
+        issues        — new issue triggers architect decomposition
+
+    Requires X-Hub-Signature-256 header signed with GITHUB_WEBHOOK_SECRET.
+    """
+    body      = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    event     = request.headers.get("X-GitHub-Event", "")
+
+    try:
+        verify_signature(body, signature)
+    except WebhookSignatureError as e:
+        log.warning("webhook: signature validation failed: %s", e)
+        raise HTTPException(401, str(e))
+
+    import json as _json
+    try:
+        payload = _json.loads(body)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
+
+    mgr = get_agent_manager()
+    log.info("webhook: received event=%r", event)
+
+    if event == "workflow_run":
+        result = await handle_workflow_run(payload, mgr, patch_queue)
+        return result
+
+    elif event == "issues":
+        result = await handle_issue_opened(payload, mgr, task_queue)
+        return result
+
+    else:
+        return {"skipped": True, "reason": f"unsupported event: {event}"}
 
 
 # ── Model list ────────────────────────────────────────────────────────────────
@@ -358,7 +420,7 @@ async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
         return f"**Architect Plan**\n\n{r.get('result','')}"
 
     elif cmd.name == "debate":
-        r = await get_debate_engine().run(topic=cmd.args, session_id=sid)
+        r         = await get_debate_engine().run(topic=cmd.args, session_id=sid)
         consensus = "✅ Consensus reached" if r.get("consensus") else "⚠️ No consensus"
         return f"**Debate Result** ({r.get('rounds',0)} round(s), {consensus})\n\n{r.get('final_plan','')}"
 
@@ -394,7 +456,8 @@ async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
     elif cmd.name == "status":
         agent_s   = get_agent_manager().get_status()
         patch_s   = patch_queue.queue_depth()
-        metrics_s = metrics.get_summary()          # Step 2.3
+        metrics_s = metrics.get_summary()
+        ft_s      = get_stats()
         return (
             f"**System Status**\n"
             f"- Agents: {agent_s['total']} total, {agent_s['running']} running, "
@@ -403,7 +466,8 @@ async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
             f"{patch_s['applied']} applied, {patch_s['rejected']} rejected\n"
             f"- Metrics: {metrics_s['total_requests']} requests, "
             f"{metrics_s['total_tokens_in']+metrics_s['total_tokens_out']} total tokens, "
-            f"avg latency {metrics_s['avg_latency_ms']}ms"
+            f"avg latency {metrics_s['avg_latency_ms']}ms\n"
+            f"- Training data: {ft_s['records']} examples collected"
         )
 
     elif cmd.name == "index":

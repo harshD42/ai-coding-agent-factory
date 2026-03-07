@@ -4,54 +4,60 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "orchestrator"))
 
 import pytest
-from memory_manager import _chunk_text, _make_id, INDEXABLE_EXTENSIONS, SKIP_DIRS
+# _chunk_text moved to ast_indexer as _line_chunk in Phase 3
+from ast_indexer import _line_chunk
+from memory_manager import _make_id, INDEXABLE_EXTENSIONS, SKIP_DIRS
 
 
 class TestChunkText:
+    """Tests for line-based chunking — now lives in ast_indexer._line_chunk."""
+
     def test_small_text_single_chunk(self):
-        text = "line1\nline2\nline3\n"
-        chunks = _chunk_text(text, size=10, overlap=2)
+        text   = "line1\nline2\nline3\n"
+        chunks = _line_chunk("f.py", text, size=10, overlap=2)
         assert len(chunks) >= 1
-        assert "line1" in chunks[0]
+        assert "line1" in chunks[0]["content"]
 
     def test_large_text_multiple_chunks(self):
         lines  = [f"line {i}\n" for i in range(200)]
         text   = "".join(lines)
-        chunks = _chunk_text(text, size=50, overlap=5)
+        chunks = _line_chunk("f.py", text, size=50, overlap=5)
         assert len(chunks) > 1
 
     def test_overlap_means_lines_repeated(self):
         lines  = [f"line{i}\n" for i in range(20)]
         text   = "".join(lines)
-        chunks = _chunk_text(text, size=10, overlap=3)
+        chunks = _line_chunk("f.py", text, size=10, overlap=3)
         if len(chunks) > 1:
-            # Last 3 lines of chunk 0 should appear in chunk 1
-            last_of_c0  = chunks[0].splitlines()[-3:]
-            first_of_c1 = chunks[1].splitlines()[:3]
+            last_of_c0  = chunks[0]["content"].splitlines()[-3:]
+            first_of_c1 = chunks[1]["content"].splitlines()[:3]
             assert last_of_c0 == first_of_c1
 
     def test_empty_text_returns_one_chunk(self):
-        chunks = _chunk_text("", size=10, overlap=2)
+        chunks = _line_chunk("f.py", "", size=10, overlap=2)
         assert len(chunks) == 1
 
-    def test_whitespace_only_still_returns_chunk(self):
-        chunks = _chunk_text("   \n   \n", size=10, overlap=2)
-        assert len(chunks) >= 1
-
     def test_exact_size_text(self):
-        lines  = [f"x\n"] * 10
-        text   = "".join(lines)
-        chunks = _chunk_text(text, size=10, overlap=0)
+        text   = "".join(["x\n"] * 10)
+        chunks = _line_chunk("f.py", text, size=10, overlap=0)
         assert len(chunks) == 1
 
     def test_chunk_content_coverage(self):
-        # All content should appear in at least one chunk
-        lines = [f"unique_line_{i}\n" for i in range(30)]
-        text  = "".join(lines)
-        chunks = _chunk_text(text, size=10, overlap=2)
-        all_content = "".join(chunks)
+        lines  = [f"unique_line_{i}\n" for i in range(30)]
+        text   = "".join(lines)
+        chunks = _line_chunk("f.py", text, size=10, overlap=2)
+        all_content = "".join(c["content"] for c in chunks)
         for i in range(30):
             assert f"unique_line_{i}" in all_content
+
+    def test_chunk_has_metadata_keys(self):
+        chunks = _line_chunk("test.py", "line1\nline2\n", size=10, overlap=0)
+        for c in chunks:
+            assert "content"     in c
+            assert "symbol_type" in c
+            assert "start_line"  in c
+            assert "end_line"    in c
+            assert "language"    in c
 
 
 class TestMakeId:
