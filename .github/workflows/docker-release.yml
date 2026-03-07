@@ -10,7 +10,7 @@ jobs:
     name: Build and Push Docker Images
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # was: read — needs write to create GitHub Releases
       packages: write
 
     steps:
