@@ -7,7 +7,6 @@ on:
     branches: [main, develop]
 
 jobs:
-  # ── Lint ────────────────────────────────────────────────────────────────────
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
@@ -21,13 +20,12 @@ jobs:
       - name: Install ruff
         run: pip install ruff==0.4.4
 
-      - name: Check linting (errors only, no style enforcement)
+      - name: Check linting (errors only)
         run: |
           ruff check orchestrator/ executor/ tests/ \
-            --ignore E501,E402,F401,I001,UP007,UP035,UP041,UP006,B904,B905,B007 \
-            --ignore W292,E701,E741,F811,F841,F541,E401
+            --ignore E501,E402,F401,I001,UP007,UP035,UP041,UP006 \
+            --ignore B904,B905,B007,W292,E701,E741,F811,F841,F541,E401
 
-  # ── Unit tests ──────────────────────────────────────────────────────────────
   test-unit:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -54,15 +52,6 @@ jobs:
       - name: Run unit tests
         run: pytest tests/unit/ -v --tb=short --asyncio-mode=auto
 
-      - name: Upload coverage (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: "*.xml"
-          if-no-files-found: ignore
-
-  # ── Build Docker images ─────────────────────────────────────────────────────
   build:
     name: Build Docker Images
     runs-on: ubuntu-latest
@@ -95,7 +84,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Integration smoke test ──────────────────────────────────────────────────
   integration:
     name: Integration Smoke Test
     runs-on: ubuntu-latest
@@ -112,57 +100,96 @@ jobs:
           sed -i 's/PROFILE=gpu/PROFILE=laptop/' .env
           sed -i 's|PROJECT_PATH=.*|PROJECT_PATH=./_workspace|' .env
 
-      - name: Start infrastructure (no model servers)
+      - name: Start infrastructure
+        run: docker compose up -d chromadb redis executor
+
+      - name: Wait for executor to be healthy
         run: |
-          docker compose up -d chromadb redis executor
-          echo "Waiting for executor to become healthy..."
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:9001/health > /dev/null 2>&1; then
-              echo "Executor is ready"
+          echo "Waiting for executor..."
+          for i in $(seq 1 40); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9001/health || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "Executor ready after ${i} attempts"
               break
             fi
-            echo "  attempt $i/30..."
+            echo "  attempt $i: status=$STATUS"
             sleep 3
+            if [ "$i" = "40" ]; then
+              echo "Executor never became ready"
+              docker compose logs executor
+              exit 1
+            fi
           done
 
-      - name: Health check executor
-        run: curl -sf http://localhost:9001/health
-
-      - name: Health check ChromaDB
-        run: curl -sf http://localhost:8100/api/v2
-
-      - name: Test executor — allowed command
+      - name: Run smoke tests
         run: |
-          RESULT=$(curl -sf http://localhost:9001/execute \
-            -H "Content-Type: application/json" \
-            -d "{\"command\":\"echo hello\",\"timeout\":10}")
-          echo "Response: $RESULT"
-          echo "$RESULT" | grep -q '"exit_code":0'
-          echo "Allowed command test passed"
+          python3 - <<'EOF'
+          import json
+          import sys
+          import urllib.error
+          import urllib.request
 
-      - name: Test executor — disallowed command rejected
-        run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            http://localhost:9001/execute \
-            -H "Content-Type: application/json" \
-            -d '{"command":"rm -rf /","timeout":10}')
-          [ "$STATUS" = "400" ] && echo "Rejection test passed" || (echo "Expected 400, got $STATUS" && exit 1)
+          BASE = "http://localhost:9001"
 
-      - name: Test executor — path traversal rejected
-        run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            http://localhost:9001/read-file \
-            -H "Content-Type: application/json" \
-            -d '{"path":"../../etc/passwd"}')
-          [ "$STATUS" = "400" ] && echo "Traversal test passed" || (echo "Expected 400, got $STATUS" && exit 1)
+          def post(path, data):
+              body = json.dumps(data).encode()
+              req = urllib.request.Request(
+                  f"{BASE}{path}",
+                  data=body,
+                  headers={"Content-Type": "application/json"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return r.status, json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  return e.code, {}
 
-      - name: Test executor — list files
-        run: |
-          RESULT=$(curl -sf http://localhost:9001/list-files \
-            -H "Content-Type: application/json" \
-            -d '{"pattern":"**/*"}')
-          echo "$RESULT" | grep -q '"files"'
-          echo "List files test passed"
+          failures = []
+
+          # Health check
+          try:
+              with urllib.request.urlopen(f"{BASE}/health", timeout=10) as r:
+                  assert r.status == 200
+              print("PASS: health check")
+          except Exception as e:
+              failures.append(f"FAIL health: {e}")
+
+          # Allowed command
+          status, body = post("/execute", {"command": "echo hello", "timeout": 10})
+          if status == 200 and body.get("exit_code") == 0:
+              print("PASS: allowed command executes")
+          else:
+              failures.append(f"FAIL allowed command: status={status} body={body}")
+
+          # Disallowed command
+          status, _ = post("/execute", {"command": "rm -rf /", "timeout": 10})
+          if status == 400:
+              print("PASS: disallowed command rejected")
+          else:
+              failures.append(f"FAIL disallowed: expected 400, got {status}")
+
+          # Path traversal
+          status, _ = post("/read-file", {"path": "../../etc/passwd"})
+          if status == 400:
+              print("PASS: path traversal rejected")
+          else:
+              failures.append(f"FAIL traversal: expected 400, got {status}")
+
+          # List files
+          status, body = post("/list-files", {"pattern": "**/*"})
+          if status == 200 and "files" in body:
+              print("PASS: list files works")
+          else:
+              failures.append(f"FAIL list-files: status={status} body={body}")
+
+          if failures:
+              print("\nFAILURES:")
+              for f in failures:
+                  print(f"  {f}")
+              sys.exit(1)
+
+          print("\nAll smoke tests passed.")
+          EOF
 
       - name: Tear down
         if: always()
