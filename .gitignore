@@ -1,0 +1,127 @@
+# ── Secrets ───────────────────────────────────────────────
+.env
+!.env.example
+
+# ── Python ────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+.installed.cfg
+MANIFEST
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+poetry.lock
+*.pyc
+
+# ── Testing ───────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+.hypothesis/
+.tox/
+nosetests.xml
+test-results/
+
+# ── Type checking ─────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# ── Linting ───────────────────────────────────────────────
+.ruff_cache/
+
+# ── Docker ────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Model / data ──────────────────────────────────────────
+*.gguf
+*.bin
+*.safetensors
+models/
+model-cache/
+
+# ── Workspace (user's project — never commit) ─────────────
+_workspace/
+memory/
+!memory/.gitkeep
+
+# ── ChromaDB / Redis data ─────────────────────────────────
+chroma-data/
+redis-data/
+ollama-data/
+
+# ── Logs ──────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS ────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── Windows ───────────────────────────────────────────────
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# ── VS Code ───────────────────────────────────────────────
+.vscode/
+!.vscode/extensions.json
+!.vscode/launch.json.example
+
+# ── JetBrains ─────────────────────────────────────────────
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# ── Node (for any JS tooling) ─────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn/
+
+# ── Test patches (generated during testing) ───────────────
+*.patch
+!tests/fixtures/*.patch
+
+# ── Misc ──────────────────────────────────────────────────
+.cache/
+.temp/
+*.pid
+output.json
+*.json.tmp

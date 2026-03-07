@@ -1,0 +1,82 @@
+name: Docker Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for orchestrator
+        id: meta-orch
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/orchestrator
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Extract metadata for executor
+        id: meta-exec
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/executor
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Create required directories
+        run: |
+          mkdir -p _workspace agents skills rules commands memory
+          touch memory/.gitkeep skills/.gitkeep rules/.gitkeep commands/.gitkeep
+
+      - name: Build and push orchestrator
+        uses: docker/build-push-action@v5
+        with:
+          context: ./orchestrator
+          push: true
+          tags: ${{ steps.meta-orch.outputs.tags }}
+          labels: ${{ steps.meta-orch.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Build and push executor
+        uses: docker/build-push-action@v5
+        with:
+          context: ./executor
+          push: true
+          tags: ${{ steps.meta-exec.outputs.tags }}
+          labels: ${{ steps.meta-exec.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            docker-compose.yml
+            .env.example

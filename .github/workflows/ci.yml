@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # ── Lint ────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff==0.4.4
+
+      - name: Check formatting
+        run: ruff format --check orchestrator/ executor/ tests/
+
+      - name: Check linting
+        run: ruff check orchestrator/ executor/ tests/
+
+  # ── Unit tests ──────────────────────────────────────────────────────────────
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            pytest==8.2.2 \
+            pytest-asyncio==0.23.7 \
+            pytest-mock==3.14.0 \
+            httpx==0.27.2 \
+            pydantic==2.9.2 \
+            fastapi==0.115.0 \
+            chromadb==0.6.3 \
+            redis==5.2.1 \
+            python-dotenv==1.0.1
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --tb=short --asyncio-mode=auto
+
+      - name: Upload coverage (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: "*.xml"
+          if-no-files-found: ignore
+
+  # ── Build Docker images ─────────────────────────────────────────────────────
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create required directories
+        run: |
+          mkdir -p _workspace agents skills rules commands memory
+          touch memory/.gitkeep skills/.gitkeep rules/.gitkeep commands/.gitkeep
+
+      - name: Build orchestrator image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./orchestrator
+          push: false
+          tags: aicaf-orchestrator:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build executor image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./executor
+          push: false
+          tags: aicaf-executor:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Integration smoke test ──────────────────────────────────────────────────
+  integration:
+    name: Integration Smoke Test
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create required directories and files
+        run: |
+          mkdir -p _workspace agents skills rules commands memory
+          touch memory/.gitkeep
+          echo "def hello(): pass" > _workspace/hello.py
+          cp .env.example .env
+          sed -i 's/PROFILE=gpu/PROFILE=laptop/' .env
+          sed -i 's|PROJECT_PATH=.*|PROJECT_PATH=./_workspace|' .env
+
+      - name: Start infrastructure (no model servers)
+        run: |
+          docker compose up -d chromadb redis executor
+          echo "Waiting for services..."
+          sleep 15
+
+      - name: Health check executor
+        run: curl -sf http://localhost:9001/health
+
+      - name: Health check ChromaDB
+        run: curl -sf http://localhost:8100/api/v2
+
+      - name: Test executor — allowed command
+        run: |
+          RESULT=$(curl -sf http://localhost:9001/execute \
+            -H "Content-Type: application/json" \
+            -d '{"command":"echo hello","timeout":10}')
+          echo "$RESULT" | grep -q '"exit_code":0'
+          echo "Allowed command test passed"
+
+      - name: Test executor — disallowed command rejected
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:9001/execute \
+            -H "Content-Type: application/json" \
+            -d '{"command":"rm -rf /","timeout":10}')
+          [ "$STATUS" = "400" ] && echo "Rejection test passed" || (echo "Expected 400, got $STATUS" && exit 1)
+
+      - name: Test executor — path traversal rejected
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:9001/read-file \
+            -H "Content-Type: application/json" \
+            -d '{"path":"../../etc/passwd"}')
+          [ "$STATUS" = "400" ] && echo "Traversal test passed" || (echo "Expected 400, got $STATUS" && exit 1)
+
+      - name: Test executor — list files
+        run: |
+          RESULT=$(curl -sf http://localhost:9001/list-files \
+            -H "Content-Type: application/json" \
+            -d '{"pattern":"**/*"}')
+          echo "$RESULT" | grep -q '"files"'
+          echo "List files test passed"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down

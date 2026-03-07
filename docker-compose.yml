@@ -1,0 +1,312 @@
+# ============================================================
+# LOCAL AI CODING AGENT FACTORY v2.1
+# ============================================================
+# Profiles:
+#   docker compose --profile gpu up -d          # Multi-GPU server
+#   docker compose --profile gpu-shared up -d   # Single GPU
+#   docker compose --profile laptop up -d       # Laptop
+#   Add --profile monitor for Open WebUI
+# ============================================================
+
+x-common: &common
+  restart: unless-stopped
+  networks:
+    - agent-net
+
+services:
+  # ────────────────────────────────────────────────────────
+  # MODEL SERVERS — Multi-GPU Profile
+  # ────────────────────────────────────────────────────────
+  vllm-coder:
+    <<: *common
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    ports:
+      - "${VLLM_CODER_PORT:-8001}:8000"
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${CODER_GPU:-0}"]
+              capabilities: [gpu]
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command: >
+      --model ${CODER_MODEL:-Qwen/Qwen3-Coder-Next-80B-A3B-Instruct}
+      --port 8000
+      --tensor-parallel-size ${CODER_TP:-1}
+      --max-model-len ${CODER_CTX:-32768}
+      --tool-call-parser qwen3_coder
+      --gpu-memory-utilization 0.92
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  vllm-architect:
+    <<: *common
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    ports:
+      - "${VLLM_ARCHITECT_PORT:-8002}:8000"
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${ARCHITECT_GPU:-1}"]
+              capabilities: [gpu]
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command: >
+      --model ${ARCHITECT_MODEL:-Qwen/Qwen3.5-35B-A3B}
+      --port 8000
+      --tensor-parallel-size ${ARCHITECT_TP:-1}
+      --max-model-len ${ARCHITECT_CTX:-65536}
+      --reasoning-parser qwen3
+      --tool-call-parser qwen3_coder
+      --gpu-memory-utilization 0.92
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  vllm-reviewer:
+    <<: *common
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    ports:
+      - "${VLLM_REVIEWER_PORT:-8003}:8000"
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${REVIEWER_GPU:-2}"]
+              capabilities: [gpu]
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command: >
+      --model ${REVIEWER_MODEL:-Qwen/QwQ-32B}
+      --port 8000
+      --tensor-parallel-size ${REVIEWER_TP:-1}
+      --max-model-len ${REVIEWER_CTX:-32768}
+      --gpu-memory-utilization 0.92
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  # ────────────────────────────────────────────────────────
+  # MODEL SERVER — Single GPU Profile
+  # ────────────────────────────────────────────────────────
+  vllm-shared:
+    <<: *common
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu-shared"]
+    ports:
+      - "${VLLM_SHARED_PORT:-8001}:8000"
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command: >
+      --model ${SHARED_MODEL:-Qwen/Qwen3-Coder-Next-80B-A3B-Instruct}
+      --port 8000
+      --max-model-len ${SHARED_CTX:-32768}
+      --tool-call-parser qwen3_coder
+      --gpu-memory-utilization 0.92
+      --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  # ────────────────────────────────────────────────────────
+  # MODEL SERVER — Laptop Profile (Ollama)
+  # ────────────────────────────────────────────────────────
+  ollama:
+    <<: *common
+    image: ollama/ollama:latest
+    profiles: ["laptop"]
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    # GPU reservation removed — add back if you have NVIDIA Container Toolkit
+    deploy:
+      resources:
+       reservations:
+           devices:
+             - driver: nvidia
+               count: all
+               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  ollama-setup:
+    <<: *common
+    image: curlimages/curl:latest
+    profiles: ["laptop"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command: >
+      -c "
+        echo 'Pulling models...' &&
+        curl -sf http://ollama:11434/api/pull -d '{\"name\":\"${OLLAMA_MODEL:-qwen2.5-coder:7b}\"}' &&
+        curl -sf http://ollama:11434/api/pull -d '{\"name\":\"${OLLAMA_EMBED:-nomic-embed-text}\"}' &&
+        echo 'Models ready!'
+      "
+    restart: "no"
+
+  # ────────────────────────────────────────────────────────
+  # EXECUTOR — Sandboxed Command Runner
+  # ────────────────────────────────────────────────────────
+  executor:
+    <<: *common
+    build:
+      context: ./executor
+      dockerfile: Dockerfile
+    ports:
+      - "${EXECUTOR_PORT:-9001}:9001"
+    volumes:
+      - ${PROJECT_PATH:-./_workspace}:/workspace
+    environment:
+      - WORKSPACE_DIR=/workspace
+      - COMMAND_TIMEOUT=${CMD_TIMEOUT:-120}
+      - ALLOWED_COMMANDS=${ALLOWED_CMDS:-pytest,npm,node,cargo,go,make,git,bash,sh,cat,ls,find,grep}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+    read_only: false
+    mem_limit: ${EXECUTOR_MEM_LIMIT:-2g}
+    cpus: ${EXECUTOR_CPUS:-2}
+    pids_limit: 64
+    tmpfs:
+      - /tmp:size=1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ────────────────────────────────────────────────────────
+  # MEMORY STACK
+  # ────────────────────────────────────────────────────────
+  chromadb:
+    <<: *common
+    image: chromadb/chroma:0.6.3
+    ports:
+      - "${CHROMA_PORT:-8100}:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - ANONYMIZED_TELEMETRY=false
+
+  redis:
+    <<: *common
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+
+  # ────────────────────────────────────────────────────────
+  # ORCHESTRATOR — The Brain
+  # ────────────────────────────────────────────────────────
+  orchestrator:
+    <<: *common
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    ports:
+      - "${ORCHESTRATOR_PORT:-9000}:9000"
+    volumes:
+      - ./orchestrator:/app
+      - ./skills:/app/skills:ro
+      - ./agents:/app/agents:ro
+      - ./rules:/app/rules:ro
+      - ./commands:/app/commands:ro
+      - ./memory:/app/memory
+      - ${PROJECT_PATH:-./_workspace}:/workspace:ro
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - CHROMA_URL=http://chromadb:8000
+      - EXECUTOR_URL=http://executor:9001
+      - CODER_URL=${CODER_ENDPOINT:-http://vllm-coder:8000/v1}
+      - ARCHITECT_URL=${ARCHITECT_ENDPOINT:-http://vllm-architect:8000/v1}
+      - REVIEWER_URL=${REVIEWER_ENDPOINT:-http://vllm-reviewer:8000/v1}
+      - OLLAMA_URL=http://ollama:11434
+      - PROFILE=${PROFILE:-gpu}
+      - EMBED_MODEL=${EMBED_MODEL:-Qwen/Qwen3-Embedding-0.6B}
+      - MAX_DEBATE_ROUNDS=${MAX_DEBATE_ROUNDS:-3}
+      - MAX_CONTEXT_TOKENS=${MAX_CONTEXT_TOKENS:-24000}
+      - MAX_AGENT_RUNTIME=${MAX_AGENT_RUNTIME:-300}
+    depends_on:
+      chromadb:
+        condition: service_started
+      redis:
+        condition: service_started
+      executor:
+        condition: service_healthy
+
+  # ────────────────────────────────────────────────────────
+  # WEB UI (optional)
+  # ────────────────────────────────────────────────────────
+  webui:
+    <<: *common
+    image: ghcr.io/open-webui/open-webui:main
+    profiles: ["monitor"]
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - webui-data:/app/backend/data
+    environment:
+      - OPENAI_API_BASE_URL=http://orchestrator:9000/v1
+      - WEBUI_AUTH=false
+
+networks:
+  agent-net:
+    driver: bridge
+
+volumes:
+  model-cache:
+  ollama-data:
+  chroma-data:
+  redis-data:
+  webui-data:
