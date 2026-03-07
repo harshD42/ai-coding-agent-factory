@@ -80,8 +80,23 @@ GITHUB_TOKEN          = os.environ.get("GITHUB_TOKEN",          "")
 GITHUB_REPO           = os.environ.get("GITHUB_REPO",           "")
 
 # ── Phase 3.4: Failure pattern learning ──────────────────────────────────────
-# Number of similar failures before auto-extracting an anti-pattern skill
 N_FAILURES_THRESHOLD = int(os.environ.get("N_FAILURES_THRESHOLD", "3"))
 
 # ── Phase 3.2: Fine-tune data collection ─────────────────────────────────────
 TRAINING_DATA_PATH = os.environ.get("TRAINING_DATA_PATH", "/app/memory/training_data.jsonl")
+
+# ── Phase 3.5: Stability & correctness ───────────────────────────────────────
+# Agent history: max messages kept per agent before trimming oldest turns
+MAX_AGENT_HISTORY        = int(os.environ.get("MAX_AGENT_HISTORY",        "20"))
+# Agent cleanup: idle agents older than this (seconds) are pruned from registry
+AGENT_IDLE_TIMEOUT       = int(os.environ.get("AGENT_IDLE_TIMEOUT",       "3600"))
+# Prompt path: load agent .md files from this directory
+AGENTS_DIR               = os.environ.get("AGENTS_DIR",               "/app/agents")
+# Patch queue: reject enqueue if this many patches are already queued
+MAX_PATCH_QUEUE_DEPTH    = int(os.environ.get("MAX_PATCH_QUEUE_DEPTH",    "50"))
+# Embed cache: max entries before LRU eviction (prevents unbounded RAM growth)
+EMBED_CACHE_MAX_SIZE     = int(os.environ.get("EMBED_CACHE_MAX_SIZE",     "1000"))
+# Executor: max concurrent sandbox operations (apply_patch + run_tests combined)
+MAX_EXECUTOR_CONCURRENCY = int(os.environ.get("MAX_EXECUTOR_CONCURRENCY", "2"))
+# Router: per-call model HTTP timeout — prevents stalled vLLM freezing agents
+MODEL_CALL_TIMEOUT       = int(os.environ.get("MODEL_CALL_TIMEOUT",       "120"))

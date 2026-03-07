@@ -113,3 +113,87 @@ class TestIsOllama:
         url = "http://vllm-shared:8001/v1"
         is_ollama = "11434" in url or "ollama" in url
         assert is_ollama is False
+
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch as mock_patch
+
+
+class TestRouterTimeout:
+    """Phase 3.5: non-streaming dispatch raises TimeoutError on stalled endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_ollama_dispatch_timeout(self):
+        """
+        Stalled Ollama endpoint triggers asyncio.TimeoutError.
+        We mock _client.post to raise TimeoutError (simulating wait_for firing)
+        and verify dispatch propagates it correctly.
+        """
+        from router import dispatch
+        from models import ChatCompletionRequest, Message
+
+        req = ChatCompletionRequest(
+            model="orchestrator",
+            messages=[Message(role="user", content="hello")],
+            stream=False,
+        )
+
+        with mock_patch("router.resolve_endpoint",
+                        AsyncMock(return_value=("http://ollama:11434", "qwen", "ollama"))), \
+             mock_patch("router._build_ollama_body", return_value={}), \
+             mock_patch("router._client") as mock_client:
+            mock_client.post = AsyncMock(side_effect=asyncio.TimeoutError())
+            with pytest.raises(asyncio.TimeoutError):
+                await dispatch(req, role="coder")
+
+    @pytest.mark.asyncio
+    async def test_vllm_dispatch_timeout(self):
+        """vLLM non-streaming path also raises TimeoutError on stall."""
+        from router import dispatch
+        from models import ChatCompletionRequest, Message
+
+        req = ChatCompletionRequest(
+            model="orchestrator",
+            messages=[Message(role="user", content="hello")],
+            stream=False,
+        )
+
+        with mock_patch("router.resolve_endpoint",
+                        AsyncMock(return_value=("http://vllm:8000/v1", "qwen-coder", "vllm"))), \
+             mock_patch("router._build_vllm_body", return_value={}), \
+             mock_patch("router._client") as mock_client:
+            mock_client.post = AsyncMock(side_effect=asyncio.TimeoutError())
+            with pytest.raises(asyncio.TimeoutError):
+                await dispatch(req, role="coder")
+
+    @pytest.mark.asyncio
+    async def test_streaming_not_affected_by_timeout(self):
+        """
+        Streaming dispatch returns async generator directly.
+        _client.post must never be called (no wait_for, no HTTP call).
+        """
+        from router import dispatch
+        from models import ChatCompletionRequest, Message
+
+        req = ChatCompletionRequest(
+            model="orchestrator",
+            messages=[Message(role="user", content="hello")],
+            stream=True,
+        )
+
+        async def empty_stream(*args, **kwargs):
+            return
+            yield   # makes it an async generator
+
+        with mock_patch("router.resolve_endpoint",
+                        AsyncMock(return_value=("http://ollama:11434", "qwen", "ollama"))), \
+             mock_patch("router._build_ollama_body", return_value={}), \
+             mock_patch("router._stream_ollama", empty_stream), \
+             mock_patch("router._client") as mock_client:
+            mock_client.post = AsyncMock(side_effect=AssertionError(
+                "_client.post must not be called for streaming dispatch"
+            ))
+            result = await dispatch(req, role="coder")
+
+        import inspect
+        assert inspect.isasyncgen(result)

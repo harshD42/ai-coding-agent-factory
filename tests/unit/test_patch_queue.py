@@ -374,3 +374,71 @@ class TestTestFixLoop:
         assert result["test_passed"] is False
         assert result["action"] == "needs_review"
         assert result["attempts"] == 2
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch as mock_patch
+from collections import deque
+
+
+class TestPatchQueuePhase35:
+    """Phase 3.5: deque, depth guard, summary initialization, Redis wiring."""
+
+    def _make_pq(self):
+        from patch_queue import PatchQueue
+        return PatchQueue()
+
+    def test_queue_is_deque(self):
+        pq = self._make_pq()
+        assert isinstance(pq._queue, deque)
+
+    @pytest.mark.asyncio
+    async def test_depth_guard_rejects_when_full(self):
+        import config
+        from patch_queue import PatchValidationError, Patch
+        pq = self._make_pq()
+        # Fill queue to limit with fake pending patches
+        for i in range(config.MAX_PATCH_QUEUE_DEPTH):
+            p = Patch("--- a/f\n+++ b/f\n@@ -1 +1 @@\n x\n", "a", f"t{i}", "s")
+            pq._queue.append(p)
+        # Next enqueue should raise
+        with pytest.raises(PatchValidationError, match="full"):
+            await pq.enqueue(
+                diff="--- a/f\n+++ b/f\n@@ -1 +1 @@\n x\n",
+                session_id="s",
+            )
+
+    def test_set_redis_stores_client(self):
+        pq    = self._make_pq()
+        redis = MagicMock()
+        pq.set_redis(redis)
+        assert pq._redis is redis
+
+    @pytest.mark.asyncio
+    async def test_persist_patch_called_on_enqueue(self):
+        pq    = self._make_pq()
+        redis = AsyncMock()
+        redis.set = AsyncMock()
+        pq.set_redis(redis)
+        diff = "--- a/f.py\n+++ b/f.py\n@@ -1,2 +1,3 @@\n x\n y\n+z\n"
+        with mock_patch("executor_client.read_file", AsyncMock(side_effect=Exception("no file"))):
+            await pq.enqueue(diff=diff, session_id="s1")
+        redis.set.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_summary_always_defined_in_test_fix_loop(self):
+        """
+        Phase 3.5 bug fix: summary must be '' if loop exits before any test run.
+        Previously used `summary if 'summary' in dir() else ''` which could NameError.
+        """
+        pq    = self._make_pq()
+        from patch_queue import Patch
+        patch = Patch("--- a/f\n+++ b/f\n@@ -1 +1 @@\n x\n", "a", "t", "s")
+        agent_mgr = MagicMock()
+
+        # _apply_patch returns rejected immediately — tests never run
+        pq._apply_patch = AsyncMock(return_value={"action": "rejected", **patch.to_dict()})
+
+        result = await pq.test_fix_loop(patch, agent_mgr, max_attempts=2)
+        # Must have test_summary key and it must be a string
+        assert "test_summary" in result
+        assert isinstance(result["test_summary"], str)

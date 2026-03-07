@@ -43,16 +43,15 @@ class TestLoadAgentPrompt:
         assert len(prompt) > 10
 
     def test_loads_from_file_when_exists(self, tmp_path):
-        agents_dir = tmp_path / "agents"
-        agents_dir.mkdir()
-        (agents_dir / "coder.md").write_text("# Custom coder prompt")
-        with patch("agent_manager.Path") as mock_path:
-            mock_p = MagicMock()
-            mock_p.exists.return_value = True
-            mock_p.read_text.return_value = "# Custom coder prompt"
-            mock_path.return_value = mock_p
+        # Write the prompt file to a real temp directory
+        (tmp_path / "coder.md").write_text("Custom coder prompt", encoding="utf-8")
+        # Patch config.AGENTS_DIR to point at our temp dir
+        # This is the correct patch target for the new path-from-config implementation
+        with mock_patch("agent_manager.config") as mock_cfg:
+            mock_cfg.AGENTS_DIR = str(tmp_path)
+            from agent_manager import _load_agent_prompt
             prompt = _load_agent_prompt("coder")
-            assert "Custom coder prompt" in prompt
+        assert "Custom coder prompt" in prompt
 
 
 class TestValidateTaskDag:
@@ -132,3 +131,127 @@ class TestAgentManagerStatus:
         assert s["running"] == 1
         assert s["done"]    == 1
         assert s["failed"]  == 2  # failed + killed both count as failed
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "orchestrator"))
+
+import time
+import pytest
+from unittest.mock import patch as mock_patch, AsyncMock, MagicMock
+from agent_manager import Agent, AgentManager, _load_agent_prompt
+
+
+class TestAgentHistoryTrim:
+    """Phase 3.5: agent._history must never exceed MAX_AGENT_HISTORY entries."""
+
+    def _make_agent(self):
+        return Agent("test-1", "coder", "sess-1")
+
+    def test_history_grows_initially(self):
+        a = self._make_agent()
+        for i in range(5):
+            a._history.append({"role": "user",      "content": f"msg {i}"})
+            a._history.append({"role": "assistant",  "content": f"reply {i}"})
+        assert len(a._history) == 10
+
+    def test_trim_enforces_max(self):
+        """Simulate what _run_agent does: append then trim."""
+        import config
+        a = self._make_agent()
+        # Fill history past the limit
+        for i in range(config.MAX_AGENT_HISTORY + 4):
+            a._history.append({"role": "user",      "content": f"u{i}"})
+            a._history.append({"role": "assistant",  "content": f"a{i}"})
+            if len(a._history) > config.MAX_AGENT_HISTORY:
+                excess = len(a._history) - config.MAX_AGENT_HISTORY
+                a._history = a._history[excess:]
+        assert len(a._history) <= config.MAX_AGENT_HISTORY
+
+    def test_trim_preserves_most_recent(self):
+        import config
+        a = self._make_agent()
+        limit = config.MAX_AGENT_HISTORY
+        # Add limit + 2 turns
+        for i in range(limit + 2):
+            a._history.append({"role": "user",      "content": f"u{i}"})
+            a._history.append({"role": "assistant",  "content": f"a{i}"})
+            if len(a._history) > limit:
+                excess = len(a._history) - limit
+                a._history = a._history[excess:]
+        # Most recent message should be the last one added
+        assert f"u{limit+1}" in a._history[-2]["content"] or \
+               f"a{limit+1}" in a._history[-1]["content"]
+
+
+class TestCleanupIdleAgents:
+    """Phase 3.5: cleanup_idle_agents prunes old terminal-state agents."""
+
+    def _make_mgr(self):
+        mem = MagicMock()
+        return AgentManager(mem)
+
+    @pytest.mark.asyncio
+    async def test_removes_old_done_agent(self):
+        import config
+        mgr = self._make_mgr()
+        a   = Agent("old-1", "coder", "s1")
+        a.status   = "done"
+        a.ended_at = time.time() - config.AGENT_IDLE_TIMEOUT - 10
+        mgr._agents["old-1"] = a
+        removed = await mgr.cleanup_idle_agents()
+        assert removed == 1
+        assert "old-1" not in mgr._agents
+
+    @pytest.mark.asyncio
+    async def test_keeps_recent_done_agent(self):
+        mgr = self._make_mgr()
+        a   = Agent("recent-1", "coder", "s1")
+        a.status   = "done"
+        a.ended_at = time.time() - 60   # 1 min ago, within timeout
+        mgr._agents["recent-1"] = a
+        removed = await mgr.cleanup_idle_agents()
+        assert removed == 0
+        assert "recent-1" in mgr._agents
+
+    @pytest.mark.asyncio
+    async def test_never_removes_running_agent(self):
+        mgr = self._make_mgr()
+        a   = Agent("run-1", "coder", "s1")
+        a.status     = "running"
+        a.started_at = time.time() - 5000   # running a long time
+        a.ended_at   = None
+        mgr._agents["run-1"] = a
+        removed = await mgr.cleanup_idle_agents()
+        assert removed == 0
+        assert "run-1" in mgr._agents
+
+    @pytest.mark.asyncio
+    async def test_removes_failed_and_killed(self):
+        import config
+        mgr   = self._make_mgr()
+        old   = time.time() - config.AGENT_IDLE_TIMEOUT - 10
+        for aid, status in [("f1", "failed"), ("k1", "killed")]:
+            a = Agent(aid, "coder", "s1")
+            a.status   = status
+            a.ended_at = old
+            mgr._agents[aid] = a
+        removed = await mgr.cleanup_idle_agents()
+        assert removed == 2
+
+
+class TestLoadAgentPromptPath:
+    """Phase 3.5: _load_agent_prompt uses config.AGENTS_DIR not hardcoded path."""
+
+    def test_uses_config_agents_dir(self, tmp_path):
+        (tmp_path / "coder.md").write_text("# Coder\nYou are a coder.")
+        with mock_patch("agent_manager.config") as mock_cfg:
+            mock_cfg.AGENTS_DIR = str(tmp_path)
+            result = _load_agent_prompt("coder")
+        assert "You are a coder." in result
+
+    def test_fallback_when_missing(self, tmp_path):
+        with mock_patch("agent_manager.config") as mock_cfg:
+            mock_cfg.AGENTS_DIR = str(tmp_path)   # empty dir
+            result = _load_agent_prompt("tester")
+        assert "tester" in result.lower()
+        assert len(result) > 0   # fallback string, not empty

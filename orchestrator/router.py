@@ -3,8 +3,12 @@ router.py — Health-aware routing to model endpoints with fallback chain.
 
 Routes requests to the correct model server based on role.
 Falls back to next healthy endpoint if the primary is down.
+
+Phase 3.5: non-streaming dispatch() wrapped in asyncio.wait_for(MODEL_CALL_TIMEOUT)
+— stalled vLLM/Ollama endpoint raises TimeoutError instead of hanging forever.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -174,6 +178,12 @@ async def dispatch(
     Route request to the correct model server.
     `messages` overrides req.messages (used by agent_manager to inject
     pre-built context from context_manager).
+
+    Phase 3.5: non-streaming calls are wrapped in asyncio.wait_for using
+    MODEL_CALL_TIMEOUT. A stalled vLLM or Ollama endpoint will raise
+    asyncio.TimeoutError instead of hanging the agent indefinitely.
+    Streaming paths are NOT wrapped — they have their own per-chunk
+    timeout behaviour via the httpx stream context.
     """
     endpoint, model, btype = await resolve_endpoint(role)
     msgs = messages or [m.model_dump(exclude_none=True) for m in req.messages]
@@ -184,7 +194,11 @@ async def dispatch(
         body = _build_ollama_body(msgs, model, req)
         if req.stream:
             return _stream_ollama(endpoint, body, model)
-        resp = await _client.post(f"{endpoint.rstrip('/')}/api/chat", json=body)
+        # Phase 3.5: timeout guard — raises asyncio.TimeoutError if stalled
+        resp = await asyncio.wait_for(
+            _client.post(f"{endpoint.rstrip('/')}/api/chat", json=body),
+            timeout=config.MODEL_CALL_TIMEOUT,
+        )
         resp.raise_for_status()
         data    = resp.json()
         content = data.get("message", {}).get("content", "")
@@ -208,6 +222,10 @@ async def dispatch(
         body = _build_vllm_body(msgs, model, req)
         if req.stream:
             return _stream_vllm(endpoint, body)
-        resp = await _client.post(f"{endpoint.rstrip('/')}/chat/completions", json=body)
+        # Phase 3.5: timeout guard — raises asyncio.TimeoutError if stalled
+        resp = await asyncio.wait_for(
+            _client.post(f"{endpoint.rstrip('/')}/chat/completions", json=body),
+            timeout=config.MODEL_CALL_TIMEOUT,
+        )
         resp.raise_for_status()
         return resp.json()

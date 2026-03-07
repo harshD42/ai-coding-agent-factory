@@ -1,8 +1,10 @@
 """
 agent_manager.py — Spawn, track, kill agents + task decomposition + watchdog.
 
-Step 2.3: metrics.record_request() is called inside _run_agent() so every
-          model call is tracked for token counts and latency.
+Phase 3.5 fixes:
+  - Agent history trimmed to MAX_AGENT_HISTORY after every turn (prevents prompt explosion)
+  - Agent prompt path loaded from config.AGENTS_DIR (not hardcoded /app/agents)
+  - cleanup_idle_agents() prunes finished agents older than AGENT_IDLE_TIMEOUT
 """
 
 import asyncio
@@ -16,7 +18,7 @@ from typing import Optional
 import config
 from context_manager import ContextManager
 from memory_manager import MemoryManager
-from metrics import metrics, parse_usage          # Step 2.3
+from metrics import metrics, parse_usage
 from models import ChatCompletionRequest, Message
 import router
 
@@ -80,7 +82,7 @@ class AgentManager:
         """
         Spawn an agent, run it, return result dict.
         Enforces MAX_AGENT_RUNTIME watchdog timeout.
-        Metrics are recorded regardless of outcome (Step 2.3).
+        Metrics are recorded regardless of outcome.
         """
         agent            = self._new_agent(role, session_id)
         agent.task       = task
@@ -109,7 +111,6 @@ class AgentManager:
             agent.error    = f"Timed out after {config.MAX_AGENT_RUNTIME}s"
             agent.ended_at = time.time()
             log.error("agent timed out  id=%s", agent.agent_id)
-            # Record as failed with 0 tokens (we never got a response)
             metrics.record_request(
                 agent_id=agent.agent_id, role=role,
                 tokens_in=0, tokens_out=0,
@@ -149,8 +150,8 @@ class AgentManager:
         """
         Build context → call model → record metrics → return response text.
 
-        Step 2.3: timer starts before the router call; usage is extracted
-        from the raw response dict before it's collapsed to a string.
+        Phase 3.5: history is trimmed to MAX_AGENT_HISTORY entries after
+        every turn to prevent prompt size growing unboundedly in long sessions.
         """
         system_prompt = _load_agent_prompt(agent.role)
         if extra_context:
@@ -169,12 +170,10 @@ class AgentManager:
             stream=False,
         )
 
-        # ── Step 2.3: time the model call ─────────────────────────────────────
         t0  = time.time()
         raw = await router.dispatch(req, role=agent.role, messages=messages)
         latency_ms = (time.time() - t0) * 1000
 
-        # Parse content + usage from the raw response dict
         content    = ""
         tokens_in  = 0
         tokens_out = 0
@@ -195,11 +194,40 @@ class AgentManager:
             session_id=agent.session_id,
             status="done",
         )
-        # ── end Step 2.3 ─────────────────────────────────────────────────────
 
+        # Append turn then trim — enforces MAX_AGENT_HISTORY (Phase 3.5)
         agent._history.append({"role": "user",      "content": task})
         agent._history.append({"role": "assistant",  "content": content})
+        if len(agent._history) > config.MAX_AGENT_HISTORY:
+            # Always drop from the front in pairs to preserve role alternation
+            excess = len(agent._history) - config.MAX_AGENT_HISTORY
+            agent._history = agent._history[excess:]
+
         return content
+
+    # ── Phase 3.5: Agent registry cleanup ────────────────────────────────────
+
+    async def cleanup_idle_agents(self) -> int:
+        """
+        Remove finished agents older than AGENT_IDLE_TIMEOUT from the registry.
+
+        Should be called periodically (e.g. on session end or via a background
+        task in main.py). Returns the number of agents removed.
+
+        Only removes agents in terminal states (done/failed/killed) — running
+        agents are never touched.
+        """
+        cutoff    = time.time() - config.AGENT_IDLE_TIMEOUT
+        terminal  = ("done", "failed", "killed")
+        to_remove = [
+            aid for aid, a in self._agents.items()
+            if a.status in terminal and (a.ended_at or 0) < cutoff
+        ]
+        for aid in to_remove:
+            del self._agents[aid]
+        if to_remove:
+            log.info("cleanup_idle_agents: removed %d stale agents", len(to_remove))
+        return len(to_remove)
 
     # ── Task decomposition ────────────────────────────────────────────────────
 
@@ -257,9 +285,18 @@ class AgentManager:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _load_agent_prompt(role: str) -> str:
-    path = Path(f"/app/agents/{role}.md")
+    """
+    Load system prompt from AGENTS_DIR/{role}.md.
+
+    Phase 3.5: path is read from config.AGENTS_DIR instead of hardcoded
+    /app/agents — this allows local development outside Docker where the
+    working directory differs from the container path.
+    """
+    path = Path(config.AGENTS_DIR) / f"{role}.md"
     if path.exists():
         return path.read_text(encoding="utf-8")
+    # Minimal fallback — logs a warning so missing files are visible
+    log.warning("agent prompt not found: %s — using fallback", path)
     return f"You are a {role} agent. Complete the task given to you accurately and concisely."
 
 

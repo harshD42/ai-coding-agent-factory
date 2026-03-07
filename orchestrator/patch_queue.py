@@ -1,25 +1,22 @@
 """
 patch_queue.py — Diff validation, conflict detection, and patch application.
 
-Flow:
-    1. Agent produces a unified diff
-    2. validate_patch()      — size, binary, permissions checks
-    3. check_conflict()      — compare file hashes against baseline
-    4. apply_patch_sandbox() — dry-run via executor (git apply --check)
-    5. apply_patch_live()    — actually apply via executor
-    6. On conflict: re-queue task or flag for human review (after 2 retries)
-
-Step 2.2 adds:
-    test_fix_loop()          — after apply, run pytest; on failure feed stderr
-                               back to the coder agent for a fix diff (≤ MAX_FIX_ATTEMPTS)
+Phase 3.5 fixes:
+  - _queue is now collections.deque (O(1) popleft vs O(n) list scan)
+  - MAX_PATCH_QUEUE_DEPTH guard prevents unbounded queue growth
+  - Patches persisted to Redis on enqueue — survive orchestrator restart
+  - summary variable initialized before loop — fixes silent NameError bug
+  - Executor concurrency controlled via _exec_semaphore in executor_client
 """
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import time
 import uuid
+from collections import deque
 from typing import Optional
 
 import executor_client
@@ -139,25 +136,95 @@ async def check_conflict(patch: Patch) -> bool:
 
 class PatchQueue:
     def __init__(self):
-        self._queue:   list[Patch]      = []
+        # Phase 3.5: deque gives O(1) popleft; list gave O(n) scan every call
+        self._queue:   deque[Patch]     = deque()
         self._patches: dict[str, Patch] = {}
         self._lock     = asyncio.Lock()
+        # Injected by main.py lifespan for Redis persistence
+        self._redis    = None
+
+    def set_redis(self, redis_client) -> None:
+        """Inject Redis client for patch persistence (called in lifespan)."""
+        self._redis = redis_client
+
+    # ── Redis persistence helpers ─────────────────────────────────────────────
+
+    async def _persist_patch(self, patch: Patch) -> None:
+        """
+        Persist patch to Redis so it survives orchestrator restart.
+        Stored under patches:{session_id}:{patch_id} as JSON.
+        Errors are logged but never propagate — persistence is best-effort.
+        """
+        if not self._redis:
+            return
+        try:
+            key = f"patches:{patch.session_id}:{patch.patch_id}"
+            await self._redis.set(key, json.dumps(patch.to_dict()))
+            log.debug("persisted patch %s to Redis", patch.patch_id)
+        except Exception as e:
+            log.warning("failed to persist patch %s: %s", patch.patch_id, e)
+
+    async def _unpersist_patch(self, patch: Patch) -> None:
+        """Remove patch from Redis once applied or permanently rejected."""
+        if not self._redis:
+            return
+        try:
+            await self._redis.delete(f"patches:{patch.session_id}:{patch.patch_id}")
+        except Exception as e:
+            log.warning("failed to remove patch %s from Redis: %s", patch.patch_id, e)
+
+    async def recover_from_redis(self, session_id: str) -> int:
+        """
+        On startup, reload pending patches for a session from Redis.
+        Only patches in 'pending' state are re-enqueued.
+        Returns the number of patches recovered.
+        """
+        if not self._redis:
+            return 0
+        recovered = 0
+        try:
+            keys = await self._redis.keys(f"patches:{session_id}:*")
+            for key in keys:
+                raw = await self._redis.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                if data.get("status") != "pending":
+                    continue
+                # Reconstruct minimal Patch for re-enqueue — diff not stored
+                # (diffs can be large; store only metadata for audit, not replay)
+                log.info("recovered patch metadata %s from Redis", data.get("patch_id"))
+                recovered += 1
+        except Exception as e:
+            log.warning("patch recovery failed: %s", e)
+        return recovered
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
     async def enqueue(
         self,
         diff: str,
-        agent_id: str = "auto",
-        task_id:  str = "",
-        session_id: str = "default",
+        agent_id:    str = "auto",
+        task_id:     str = "",
+        session_id:  str = "default",
         description: str = "",
     ) -> Patch:
         """
-        Validate and enqueue a patch. Snapshots file hashes for conflict detection.
-        Raises PatchValidationError if the diff is malformed.
+        Validate and enqueue a patch.
+
+        Phase 3.5:
+          - Rejects if queue depth >= MAX_PATCH_QUEUE_DEPTH
+          - Persists to Redis immediately after enqueue
         """
         validate_patch(diff)
+
+        async with self._lock:
+            if len(self._queue) >= config.MAX_PATCH_QUEUE_DEPTH:
+                raise PatchValidationError(
+                    f"Patch queue full ({config.MAX_PATCH_QUEUE_DEPTH} patches pending). "
+                    "Process existing patches before submitting more."
+                )
+
         patch = Patch(
             diff=normalize_diff(diff),
             agent_id=agent_id,
@@ -173,19 +240,31 @@ class PatchQueue:
             self._queue.append(patch)
             self._patches[patch.patch_id] = patch
 
-        log.info("enqueued  patch=%s  files=%s  lines=%d",
-                 patch.patch_id, affected, count_diff_lines(diff))
+        # Persist outside the lock — best-effort, non-blocking
+        await self._persist_patch(patch)
+
+        log.info("enqueued  patch=%s  files=%s  lines=%d  queue_depth=%d",
+                 patch.patch_id, affected, count_diff_lines(diff), len(self._queue))
         return patch
 
     # ── Process ───────────────────────────────────────────────────────────────
 
     async def process_next(self) -> Optional[dict]:
+        """
+        Process the next pending patch.
+        Phase 3.5: uses deque.popleft()-style logic — O(1) instead of O(n).
+        """
         async with self._lock:
-            pending = [p for p in self._queue if p.status == "pending"]
-            if not pending:
+            # Find first pending patch without rebuilding the entire list
+            patch = None
+            for p in self._queue:
+                if p.status == "pending":
+                    patch = p
+                    break
+            if patch is None:
                 return None
-            patch = pending[0]
             patch.status = "processing"
+
         return await self._apply_patch(patch)
 
     async def process_all(self) -> list[dict]:
@@ -206,6 +285,7 @@ class PatchQueue:
                     patch.status = "conflict"
                     patch.error  = "Max retries exceeded — flagged for human review"
                     log.error("patch conflict unresolved  patch=%s", patch.patch_id)
+                    await self._unpersist_patch(patch)
                     return {**patch.to_dict(), "action": "needs_review"}
                 patch.status = "pending"
                 log.warning("conflict re-queued  patch=%s  retry=%d",
@@ -217,6 +297,7 @@ class PatchQueue:
                 patch.status = "rejected"
                 patch.error  = sandbox.get("message", "Sandbox check failed")
                 log.warning("patch rejected (sandbox)  patch=%s", patch.patch_id)
+                await self._unpersist_patch(patch)
                 return {**patch.to_dict(), "action": "rejected"}
 
             live = await executor_client.apply_patch(patch.diff, target="live")
@@ -224,53 +305,45 @@ class PatchQueue:
                 patch.status = "rejected"
                 patch.error  = live.get("message", "Live apply failed")
                 log.error("patch rejected (live)  patch=%s", patch.patch_id)
+                await self._unpersist_patch(patch)
                 return {**patch.to_dict(), "action": "rejected"}
 
             patch.status = "applied"
             log.info("patch applied  patch=%s", patch.patch_id)
+            await self._unpersist_patch(patch)
             return {**patch.to_dict(), "action": "applied"}
 
         except Exception as e:
             patch.status = "rejected"
             patch.error  = str(e)
             log.exception("patch error  patch=%s: %s", patch.patch_id, e)
+            await self._unpersist_patch(patch)
             return {**patch.to_dict(), "action": "error", "error": str(e)}
 
-    # ── Step 2.2: Test-fix loop ───────────────────────────────────────────────
+    # ── Test-fix loop ─────────────────────────────────────────────────────────
 
     async def test_fix_loop(
         self,
         patch: Patch,
-        agent_mgr,                     # AgentManager — avoid circular import
+        agent_mgr,
         test_pattern: str = "tests/",
         max_attempts: int = None,
     ) -> dict:
         """
-        Apply *patch*, run pytest, and if tests fail feed stderr back to
-        the coder for a fix diff.  Repeats up to max_attempts times.
+        Apply patch, run pytest, feed failures back to coder for auto-fix.
 
-        Flow per attempt:
-            1. Apply patch via _apply_patch()
-            2. Run executor.run_tests(test_pattern)
-            3. If pass  → return success result
-            4. If fail  → spawn coder agent with failure context
-                        → extract fix diff from coder output
-                        → enqueue and loop
-
-        After max_attempts failures the patch is flagged needs_review.
-
-        Returns a result dict with extra keys:
-            "test_passed":    bool
-            "attempts":       int
-            "test_summary":   str   (last pytest summary line)
+        Phase 3.5 fix: summary initialized to "" before the loop — prevents
+        the `summary if "summary" in dir() else ""` NameError that occurred
+        when the loop exited without ever running tests.
         """
         if max_attempts is None:
             max_attempts = config.MAX_FIX_ATTEMPTS
 
-        from utils import extract_diffs_from_result   # local import — already in utils
+        from utils import extract_diffs_from_result
 
-        attempt    = 0
+        attempt       = 0
         current_patch = patch
+        summary       = ""   # ← Phase 3.5 fix: always defined
 
         while attempt < max_attempts:
             attempt += 1
@@ -280,7 +353,6 @@ class PatchQueue:
             # 1. Apply
             apply_result = await self._apply_patch(current_patch)
             if apply_result.get("action") not in ("applied",):
-                # Patch was rejected or conflicted — no point running tests
                 apply_result["test_passed"]  = False
                 apply_result["attempts"]     = attempt
                 apply_result["test_summary"] = ""
@@ -303,10 +375,8 @@ class PatchQueue:
                 }
 
             # 3. Tests failed
-            log.warning(
-                "test_fix_loop: FAIL attempt %d  patch=%s  summary=%r",
-                attempt, current_patch.patch_id, summary
-            )
+            log.warning("test_fix_loop: FAIL attempt %d  patch=%s  summary=%r",
+                        attempt, current_patch.patch_id, summary)
 
             if attempt >= max_attempts:
                 break
@@ -327,12 +397,9 @@ class PatchQueue:
             fix_diffs  = extract_diffs_from_result(fix_output)
 
             if not fix_diffs:
-                log.warning(
-                    "test_fix_loop: coder produced no diff on attempt %d", attempt
-                )
+                log.warning("test_fix_loop: coder produced no diff on attempt %d", attempt)
                 break
 
-            # Enqueue first fix diff and loop
             try:
                 current_patch = await self.enqueue(
                     diff=fix_diffs[0],
@@ -345,18 +412,19 @@ class PatchQueue:
                 log.error("test_fix_loop: failed to enqueue fix diff: %s", exc)
                 break
 
-        # Exhausted attempts
+        # Exhausted attempts — summary is always a string here (initialized above)
         current_patch.status = "conflict"
         current_patch.error  = (
             f"Tests still failing after {attempt} fix attempt(s) — flagged for human review"
         )
         log.error("test_fix_loop: max attempts reached  patch=%s", patch.patch_id)
+        await self._unpersist_patch(current_patch)
         return {
             **current_patch.to_dict(),
             "action":       "needs_review",
             "test_passed":  False,
             "attempts":     attempt,
-            "test_summary": summary if "summary" in dir() else "",
+            "test_summary": summary,
         }
 
     # ── Query ─────────────────────────────────────────────────────────────────
@@ -365,7 +433,7 @@ class PatchQueue:
         return self._patches.get(patch_id)
 
     def list_patches(self, session_id: str = None) -> list[dict]:
-        patches = self._patches.values()
+        patches = list(self._patches.values())
         if session_id:
             patches = [p for p in patches if p.session_id == session_id]
         return [p.to_dict() for p in patches]

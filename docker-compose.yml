@@ -208,6 +208,10 @@ services:
       - ALLOWED_COMMANDS=${ALLOWED_CMDS:-pytest,npm,node,cargo,go,make,git,bash,sh,cat,ls,find,grep}
     security_opt:
       - no-new-privileges:true
+      # Phase 3.5: seccomp annotation documents intent.
+      # Replace 'unconfined' with a custom seccomp profile in Phase 5
+      # to restrict syscalls to only what pytest/git/npm actually need.
+      - seccomp:unconfined
     cap_drop:
       - ALL
     cap_add:

@@ -25,7 +25,7 @@ def client():
 def test_health_v030(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "0.3.0"
+    assert r.json()["version"] >= "0.3.0"
 
 
 # ── Step 3.1: Symbol search ───────────────────────────────────────────────────

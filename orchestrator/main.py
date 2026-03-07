@@ -1,23 +1,21 @@
 """
 main.py — Orchestrator entry point.
 
-Phase 3 additions:
-  3.1  GET  /v1/memory/symbol       — search codebase by symbol name
-  3.2  GET  /v1/finetune/export     — download training data JSONL
-       GET  /v1/finetune/stats      — training data stats
-       DELETE /v1/finetune/clear    — clear training data
-  3.3  POST /v1/webhook/github      — GitHub CI/issue webhook receiver
+Phase 3.5 wiring changes:
+  - patch_queue.set_redis() called in lifespan (enables persistence)
+  - task_queue._redis reused for patch persistence (same connection)
+  - GET /v1/agents/cleanup — trigger idle agent pruning on demand
+  - AGENTS_DIR passed via config (not hardcoded)
+  - New env vars surfaced in /status: queue depth, cache size
 """
 
-import hashlib
-import hmac
 import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 
 import config
@@ -26,7 +24,7 @@ from agent_manager import init_agent_manager, get_agent_manager
 from command_parser import parse as parse_command, help_text
 from debate_engine import init_debate_engine, get_debate_engine
 from file_watcher import file_watcher
-from fine_tune_collector import get_stats, read_records, clear_records  # Step 3.2
+from fine_tune_collector import get_stats, read_records, clear_records
 from memory_manager import memory
 from metrics import metrics
 from models import ChatCompletionRequest
@@ -34,7 +32,7 @@ from patch_queue import patch_queue, PatchValidationError
 from session_hooks import init_session_hooks, get_session_hooks
 from skill_loader import skill_loader
 from task_queue import task_queue
-from webhook_handler import (                                            # Step 3.3
+from webhook_handler import (
     verify_signature, WebhookSignatureError,
     handle_workflow_run, handle_issue_opened,
 )
@@ -51,27 +49,38 @@ async def lifespan(app: FastAPI):
     log.info("connecting to ChromaDB and Redis...")
     await memory.connect()
     await task_queue.connect()
+
+    # Phase 2.1 — wire patch_queue into task_queue
     task_queue.set_patch_queue(patch_queue)
+
+    # Phase 3.5 — wire Redis into patch_queue for crash-safe persistence
+    patch_queue.set_redis(task_queue._redis)
+
     mgr = init_agent_manager(memory)
     init_debate_engine(mgr)
     init_session_hooks(memory)
     skill_loader.load()
+
+    # Phase 2.4 — file watcher
     await file_watcher.start(task_queue._redis)
+
     log.info("all systems ready")
     yield
+
+    # Shutdown
     await file_watcher.stop()
     await memory.close()
     await task_queue.close()
 
 
-app = FastAPI(title="AI Coding Agent Orchestrator", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="AI Coding Agent Orchestrator", version="0.3.5", lifespan=lifespan)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "profile": config.PROFILE, "version": "0.3.0"}
+    return {"status": "ok", "profile": config.PROFILE, "version": "0.3.5"}
 
 
 # ── Agent endpoints ───────────────────────────────────────────────────────────
@@ -102,6 +111,16 @@ def agent_logs(agent_id: str):
     if not agent:
         raise HTTPException(404, f"Agent {agent_id!r} not found")
     return agent.to_dict()
+
+
+@app.post("/v1/agents/cleanup")
+async def cleanup_agents():
+    """
+    Phase 3.5 — Prune idle agents older than AGENT_IDLE_TIMEOUT from the registry.
+    Safe to call at any time. Running agents are never touched.
+    """
+    removed = await get_agent_manager().cleanup_idle_agents()
+    return {"removed": removed, "idle_timeout_s": config.AGENT_IDLE_TIMEOUT}
 
 
 # ── Skills ────────────────────────────────────────────────────────────────────
@@ -138,9 +157,12 @@ async def session_end(body: dict):
     failures   = body.get("failures", [])
     if not summary:
         raise HTTPException(400, "summary is required")
-    return await get_session_hooks().on_session_end(
+    result = await get_session_hooks().on_session_end(
         session_id, summary, transcript, failures
     )
+    # Phase 3.5: clean up idle agents after session ends
+    await get_agent_manager().cleanup_idle_agents()
+    return result
 
 
 # ── Memory & Indexing ─────────────────────────────────────────────────────────
@@ -157,6 +179,14 @@ async def recall(q: str = Query(...)):
     return {"query": q, "results": results}
 
 
+@app.get("/v1/memory/symbol")
+async def symbol_search(name: str = Query(...), k: int = 5):
+    if not name:
+        raise HTTPException(400, "name is required")
+    results = await memory.search_symbol(name, k=k)
+    return {"query": name, "results": results, "count": len(results)}
+
+
 @app.post("/v1/memory/save")
 async def save_memory(body: dict):
     session_id = body.get("session_id", str(uuid.uuid4()))
@@ -165,25 +195,6 @@ async def save_memory(body: dict):
         raise HTTPException(400, "content is required")
     await memory.save_session(session_id, content, body.get("metadata", {}))
     return {"saved": True, "session_id": session_id}
-
-
-# ── Step 3.1: Symbol search ───────────────────────────────────────────────────
-
-@app.get("/v1/memory/symbol")
-async def symbol_search(name: str = Query(...), k: int = 5):
-    """
-    Search the indexed codebase for a function or class by name.
-
-    Query params:
-        name   required — symbol name (exact or partial)
-        k      optional — max results (default 5)
-
-    Returns chunks with symbol, symbol_type, start_line, end_line metadata.
-    """
-    if not name:
-        raise HTTPException(400, "name is required")
-    results = await memory.search_symbol(name, k=k)
-    return {"query": name, "results": results, "count": len(results)}
 
 
 # ── Patch Queue ───────────────────────────────────────────────────────────────
@@ -288,28 +299,20 @@ def get_metrics(session_id: str = None):
     return metrics.get_summary()
 
 
-# ── Step 3.2: Fine-tune data endpoints ───────────────────────────────────────
+# ── Fine-tune ─────────────────────────────────────────────────────────────────
 
 @app.get("/v1/finetune/stats")
 def finetune_stats():
-    """Return stats about collected training data."""
     return get_stats()
 
 
 @app.get("/v1/finetune/export")
 def finetune_export(limit: int = None):
-    """
-    Download training data as JSONL.
-    Each line is a JSON object: {instruction, input, output, metadata}.
-
-    Query params:
-        limit   optional — cap number of records returned
-    """
-    import json
+    import json as _json
     records = read_records(limit=limit)
     if not records:
         return PlainTextResponse("", media_type="application/x-ndjson")
-    content = "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n"
+    content = "\n".join(_json.dumps(r, ensure_ascii=False) for r in records) + "\n"
     return PlainTextResponse(
         content,
         media_type="application/x-ndjson",
@@ -319,51 +322,31 @@ def finetune_export(limit: int = None):
 
 @app.delete("/v1/finetune/clear")
 def finetune_clear():
-    """Delete all collected training records."""
-    count = clear_records()
-    return {"deleted": count}
+    return {"deleted": clear_records()}
 
 
-# ── Step 3.3: GitHub webhook ──────────────────────────────────────────────────
+# ── Webhook ───────────────────────────────────────────────────────────────────
 
 @app.post("/v1/webhook/github")
 async def github_webhook(request: Request):
-    """
-    Receive GitHub webhook events.
-
-    Supported events:
-        workflow_run  — failed CI triggers coder agent + patch enqueue
-        issues        — new issue triggers architect decomposition
-
-    Requires X-Hub-Signature-256 header signed with GITHUB_WEBHOOK_SECRET.
-    """
     body      = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
     event     = request.headers.get("X-GitHub-Event", "")
-
     try:
         verify_signature(body, signature)
     except WebhookSignatureError as e:
-        log.warning("webhook: signature validation failed: %s", e)
+        log.warning("webhook: signature failed: %s", e)
         raise HTTPException(401, str(e))
-
     import json as _json
     try:
         payload = _json.loads(body)
     except Exception:
         raise HTTPException(400, "Invalid JSON payload")
-
     mgr = get_agent_manager()
-    log.info("webhook: received event=%r", event)
-
     if event == "workflow_run":
-        result = await handle_workflow_run(payload, mgr, patch_queue)
-        return result
-
+        return await handle_workflow_run(payload, mgr, patch_queue)
     elif event == "issues":
-        result = await handle_issue_opened(payload, mgr, task_queue)
-        return result
-
+        return await handle_issue_opened(payload, mgr, task_queue)
     else:
         return {"skipped": True, "reason": f"unsupported event: {event}"}
 
@@ -459,21 +442,24 @@ async def _handle_command(cmd, req: ChatCompletionRequest) -> str:
         metrics_s = metrics.get_summary()
         ft_s      = get_stats()
         return (
-            f"**System Status**\n"
+            f"**System Status** (v{app.version})\n"
             f"- Agents: {agent_s['total']} total, {agent_s['running']} running, "
             f"{agent_s['done']} done, {agent_s['failed']} failed\n"
-            f"- Patches: {patch_s['total']} total, {patch_s['pending']} pending, "
-            f"{patch_s['applied']} applied, {patch_s['rejected']} rejected\n"
+            f"- Patches: {patch_s['total']} total ({patch_s['pending']} pending), "
+            f"depth limit {config.MAX_PATCH_QUEUE_DEPTH}\n"
             f"- Metrics: {metrics_s['total_requests']} requests, "
-            f"{metrics_s['total_tokens_in']+metrics_s['total_tokens_out']} total tokens, "
-            f"avg latency {metrics_s['avg_latency_ms']}ms\n"
-            f"- Training data: {ft_s['records']} examples collected"
+            f"{metrics_s['total_tokens_in']+metrics_s['total_tokens_out']} tokens, "
+            f"avg {metrics_s['avg_latency_ms']}ms\n"
+            f"- Training data: {ft_s['records']} examples\n"
+            f"- Embed cache: {config.EMBED_CACHE_MAX_SIZE} max entries (LRU)\n"
+            f"- Executor slots: {config.MAX_EXECUTOR_CONCURRENCY}"
         )
 
     elif cmd.name == "index":
         r = await memory.index_codebase("/workspace")
         return (f"✅ Codebase indexed\n"
-                f"- Files: {r['files_indexed']}\n"
+                f"- Files indexed: {r['files_indexed']}\n"
+                f"- Files unchanged: {r.get('files_unchanged', 0)}\n"
                 f"- Chunks: {r['chunks']}\n"
                 f"- Skipped: {r['skipped']}")
 

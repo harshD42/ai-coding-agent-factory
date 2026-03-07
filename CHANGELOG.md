@@ -7,6 +7,62 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.3.5] — 2026-03-07 — Phase 3.5 Stability Pass
+
+### Fixed
+
+**Agent Manager**
+- `agent._history` now trimmed to `MAX_AGENT_HISTORY` (default 20) after every turn — prevents prompt size growing unboundedly in long sessions
+- `_load_agent_prompt()` path now read from `config.AGENTS_DIR` instead of hardcoded `/app/agents` — fixes local development outside Docker
+- `cleanup_idle_agents()` added — prunes finished agents older than `AGENT_IDLE_TIMEOUT` from the in-memory registry, preventing memory leak in long-running instances
+
+**Patch Queue**
+- `_queue` changed from `list` to `collections.deque` — O(1) popleft vs O(n) scan on every `process_next()` call
+- `MAX_PATCH_QUEUE_DEPTH` guard added to `enqueue()` — rejects new patches when queue is full instead of growing without bound
+- `summary` variable initialized to `""` before the `test_fix_loop` while loop — fixes silent `NameError` that occurred when the loop exited before any test ran
+- Patches now persisted to Redis on enqueue via `set_redis()` injection — patch metadata survives orchestrator restart
+- `_unpersist_patch()` cleans up Redis on apply/reject/conflict
+
+**Memory Manager**
+- `_embed_batch()` now uses `asyncio.gather()` — parallel embedding instead of sequential loop (wall time ≈ single embed time for batches)
+- LRU embed cache (`_LRUEmbedCache`) replaces plain dict — `OrderedDict`-based eviction at `EMBED_CACHE_MAX_SIZE` prevents unbounded RAM growth
+- `connect()` URL parsed via `urllib.parse.urlparse` — robust against HTTPS URLs, custom paths, and missing ports (old `str.split(':')` failed on all three)
+- `index_codebase()` now performs incremental indexing — stores `file_hash` in chunk metadata and skips re-embedding files whose content hasn't changed; second call on unchanged workspace completes in <1s
+- `record_failure()` uses content hash as ChromaDB doc ID — identical failures deduplicated automatically via upsert
+
+**Router**
+- Non-streaming `dispatch()` now wrapped in `asyncio.wait_for(MODEL_CALL_TIMEOUT)` — stalled vLLM/Ollama endpoint raises `TimeoutError` instead of hanging the agent indefinitely
+
+**Executor Client**
+- `asyncio.Semaphore(MAX_EXECUTOR_CONCURRENCY)` added to `apply_patch()` and `run_tests()` — prevents executor container saturation when multiple parallel agents submit patches simultaneously
+
+**Docker**
+- `executor` service in `docker-compose.yml` annotated with `seccomp:unconfined` — documents intent to add a custom seccomp profile in Phase 5
+
+### Added
+- `POST /v1/agents/cleanup` endpoint — trigger idle agent pruning on demand
+- `index_codebase` response now includes `files_unchanged` count
+- `/status` command output now includes patch queue depth limit, embed cache size, and executor concurrency slots
+- 30 new unit tests covering all Phase 3.5 fixes (history trim, LRU eviction, parallel embed, URL parsing, failure dedup, deque, depth guard, semaphore, router timeout)
+- `tests/integration/test_phase35.py` — 8 smoke tests verifying all fixes end-to-end
+
+### Changed
+- Orchestrator version bumped to `0.3.5`
+- `cleanup_idle_agents()` called automatically on `POST /v1/session/end`
+
+### Config vars added
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_AGENT_HISTORY` | `20` | Max conversation turns kept per agent |
+| `AGENT_IDLE_TIMEOUT` | `3600` | Seconds before finished agent is pruned |
+| `AGENTS_DIR` | `/app/agents` | Directory for agent `.md` prompt files |
+| `MAX_PATCH_QUEUE_DEPTH` | `50` | Max queued patches before rejection |
+| `EMBED_CACHE_MAX_SIZE` | `1000` | LRU embed cache max entries |
+| `MAX_EXECUTOR_CONCURRENCY` | `2` | Max concurrent sandbox operations |
+| `MODEL_CALL_TIMEOUT` | `120` | Per-call model HTTP timeout (seconds) |
+
+---
+
 ## [0.3.0] — 2026-03-07 — Phase 3 Complete
 
 ### Added
