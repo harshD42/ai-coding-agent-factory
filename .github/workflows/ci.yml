@@ -154,8 +154,8 @@ jobs:
           except Exception as e:
               failures.append(f"FAIL health: {e}")
 
-          # Allowed command
-          status, body = post("/execute", {"command": "echo hello", "timeout": 10})
+          # Allowed command (use 'sh' which is in the whitelist)
+          status, body = post("/execute", {"command": "sh -c 'echo hello'", "timeout": 10})
           if status == 200 and body.get("exit_code") == 0:
               print("PASS: allowed command executes")
           else:
