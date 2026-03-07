@@ -135,7 +135,8 @@ jobs:
         run: |
           RESULT=$(curl -sf http://localhost:9001/execute \
             -H "Content-Type: application/json" \
-            -d '{"command":"echo hello","timeout":10}')
+            -d "{\"command\":\"echo hello\",\"timeout\":10}")
+          echo "Response: $RESULT"
           echo "$RESULT" | grep -q '"exit_code":0'
           echo "Allowed command test passed"
 

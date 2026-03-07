@@ -61,7 +61,7 @@ class TestCountMessagesTokens:
 
     def test_overhead_only_for_empty_content(self):
         msgs = [{"role": "user", "content": ""}]
-        assert count_messages_tokens(msgs) == 4  # 4 overhead, 1 token min content
+        assert count_messages_tokens(msgs) == 5  # count_tokens("") == 1 min + 4 overhead
 
     def test_multiple_messages(self):
         msgs = [
