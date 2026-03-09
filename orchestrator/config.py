@@ -2,15 +2,67 @@
 config.py — Load environment variables and build routing tables.
 
 All other modules import from here. Nothing reads os.environ directly.
+
+Phase 4A.2: ROLE_ENDPOINTS and ROLE_MODELS removed. Per-session model
+resolution now lives in routing_policy.py (RoutingPolicy). Profile URL
+constants and model name constants are kept — RoutingPolicy uses them.
+
+Phase 4B.1: SESSION_TTL added (7-day canonical session lifetime).
+SESSION_MODELS_TTL is deprecated — SessionManager now uses SESSION_TTL
+for both session:state and session:models keys so they never diverge.
+SESSION_MODELS_TTL kept temporarily so /v1/session/configure callers that
+read it from config don't break before Phase 5 (Postgres) removes it.
 """
 
 import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ── Profile ───────────────────────────────────────────────────────────────────
-PROFILE = os.environ.get("PROFILE", "laptop")
+
+def _detect_profile() -> str:
+    """
+    Auto-detect hardware profile if PROFILE=auto.
+    Checks for NVIDIA GPU via nvidia-smi, falls back to laptop.
+    Decision is logged at WARNING level so it is always visible in
+    orchestrator startup logs regardless of log level.
+    """
+    import subprocess
+    _log = logging.getLogger("config")
+
+    requested = os.environ.get("PROFILE", "laptop")
+    if requested != "auto":
+        return requested
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            timeout=5, stderr=subprocess.DEVNULL,
+        )
+        vrams         = [int(v.strip()) for v in out.decode().strip().splitlines() if v.strip()]
+        total_vram_mb = sum(vrams)
+        gpu_count     = len(vrams)
+        if gpu_count >= 3 and total_vram_mb >= 120_000:
+            profile = "gpu"
+        elif gpu_count >= 1 and total_vram_mb >= 20_000:
+            profile = "gpu-shared"
+        else:
+            profile = "laptop"
+        _log.warning(
+            "PROFILE=auto detected %d GPU(s), %dMB total VRAM → selected profile: %s",
+            gpu_count, total_vram_mb, profile,
+        )
+    except Exception as e:
+        profile = "laptop"
+        _log.warning(
+            "PROFILE=auto: nvidia-smi unavailable (%s) → falling back to profile: laptop", e,
+        )
+    return profile
+
+
+PROFILE = _detect_profile()
 
 # ── Model server URLs ─────────────────────────────────────────────────────────
 OLLAMA_URL     = os.environ.get("OLLAMA_URL",     "http://ollama:11434")
@@ -23,38 +75,12 @@ OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL",    "qwen2.5-coder:7b")
 CODER_MODEL     = os.environ.get("CODER_MODEL",     "Qwen/Qwen3-Coder-Next-80B-A3B-Instruct")
 ARCHITECT_MODEL = os.environ.get("ARCHITECT_MODEL", "Qwen/Qwen3.5-35B-A3B")
 REVIEWER_MODEL  = os.environ.get("REVIEWER_MODEL",  "Qwen/QwQ-32B")
+SHARED_MODEL    = os.environ.get("SHARED_MODEL",    "Qwen/Qwen3-Coder-Next-80B-A3B-Instruct")
 
-# ── Role → endpoint mapping ───────────────────────────────────────────────────
-if PROFILE == "laptop":
-    ROLE_ENDPOINTS: dict[str, str] = {
-        "architect":  OLLAMA_URL,
-        "coder":      OLLAMA_URL,
-        "reviewer":   OLLAMA_URL,
-        "tester":     OLLAMA_URL,
-        "documenter": OLLAMA_URL,
-    }
-    ROLE_MODELS: dict[str, str] = {r: OLLAMA_MODEL for r in ROLE_ENDPOINTS}
-elif PROFILE == "gpu-shared":
-    shared       = os.environ.get("CODER_URL", "http://vllm-shared:8000/v1")
-    shared_model = os.environ.get("SHARED_MODEL", "Qwen/Qwen3-Coder-Next-80B-A3B-Instruct")
-    ROLE_ENDPOINTS = {r: shared for r in ("architect","coder","reviewer","tester","documenter")}
-    ROLE_MODELS    = {r: shared_model for r in ROLE_ENDPOINTS}
-else:  # gpu
-    ROLE_ENDPOINTS = {
-        "architect":  ARCHITECT_URL,
-        "coder":      CODER_URL,
-        "reviewer":   REVIEWER_URL,
-        "tester":     CODER_URL,
-        "documenter": ARCHITECT_URL,
-    }
-    ROLE_MODELS = {
-        "architect":  ARCHITECT_MODEL,
-        "coder":      CODER_MODEL,
-        "reviewer":   REVIEWER_MODEL,
-        "tester":     CODER_MODEL,
-        "documenter": ARCHITECT_MODEL,
-    }
+# Phase 4A.2: ROLE_ENDPOINTS and ROLE_MODELS removed.
+# Per-session model resolution lives in routing_policy.RoutingPolicy.
 
+# Fallback chain for health-aware routing (used by router._is_healthy fallback)
 FALLBACK_ORDER = [CODER_URL, ARCHITECT_URL, REVIEWER_URL, OLLAMA_URL]
 
 # ── Orchestrator config ───────────────────────────────────────────────────────
@@ -86,17 +112,48 @@ N_FAILURES_THRESHOLD = int(os.environ.get("N_FAILURES_THRESHOLD", "3"))
 TRAINING_DATA_PATH = os.environ.get("TRAINING_DATA_PATH", "/app/memory/training_data.jsonl")
 
 # ── Phase 3.5: Stability & correctness ───────────────────────────────────────
-# Agent history: max messages kept per agent before trimming oldest turns
 MAX_AGENT_HISTORY        = int(os.environ.get("MAX_AGENT_HISTORY",        "20"))
-# Agent cleanup: idle agents older than this (seconds) are pruned from registry
 AGENT_IDLE_TIMEOUT       = int(os.environ.get("AGENT_IDLE_TIMEOUT",       "3600"))
-# Prompt path: load agent .md files from this directory
 AGENTS_DIR               = os.environ.get("AGENTS_DIR",               "/app/agents")
-# Patch queue: reject enqueue if this many patches are already queued
 MAX_PATCH_QUEUE_DEPTH    = int(os.environ.get("MAX_PATCH_QUEUE_DEPTH",    "50"))
-# Embed cache: max entries before LRU eviction (prevents unbounded RAM growth)
 EMBED_CACHE_MAX_SIZE     = int(os.environ.get("EMBED_CACHE_MAX_SIZE",     "1000"))
-# Executor: max concurrent sandbox operations (apply_patch + run_tests combined)
 MAX_EXECUTOR_CONCURRENCY = int(os.environ.get("MAX_EXECUTOR_CONCURRENCY", "2"))
-# Router: per-call model HTTP timeout — prevents stalled vLLM freezing agents
 MODEL_CALL_TIMEOUT       = int(os.environ.get("MODEL_CALL_TIMEOUT",       "120"))
+
+# ── Phase 4A.2: Dynamic model assignment ─────────────────────────────────────
+# DEPRECATED: SESSION_MODELS_TTL is superseded by SESSION_TTL (Phase 4B.1).
+# Both session:state and session:models now share SESSION_TTL so they never
+# diverge. SESSION_MODELS_TTL is kept here to avoid breaking any callers that
+# read it directly; it will be removed when Phase 5 (Postgres) lands.
+SESSION_MODELS_TTL   = int(os.environ.get("SESSION_MODELS_TTL",   "86400"))   # DEPRECATED
+# TTL for task lease keys — prevents duplicate execution on restart (10 min)
+TASK_LEASE_TTL       = int(os.environ.get("TASK_LEASE_TTL",       "600"))
+
+# ── Phase 4A.4: LiteLLM gateway (optional, flag-gated) ───────────────────────
+USE_LITELLM = os.environ.get("USE_LITELLM", "false").lower() == "true"
+
+# ── Phase 4B.1: Session lifecycle ─────────────────────────────────────────────
+# Canonical session TTL — used for BOTH session:state and session:models keys.
+# 7 days: long enough for a multi-day coding project, short enough to not
+# accumulate stale state in Redis forever.
+SESSION_TTL = int(os.environ.get("SESSION_TTL", str(7 * 24 * 3600)))   # 604800s
+
+# ── Phase 4B.2: Streaming ─────────────────────────────────────────────────────
+# WebSocket keepalive ping interval (seconds). Prevents proxy/load-balancer
+# idle connection timeouts during long agent runs.
+WS_HEARTBEAT_INTERVAL = int(os.environ.get("WS_HEARTBEAT_INTERVAL", "30"))
+
+# ── Phase 4B.3: Agent bus ─────────────────────────────────────────────────────
+# How long structured bus events linger in Redis pub/sub history.
+# Not a hard expiry — Redis pub/sub is fire-and-forget; this is for any
+# supplementary LIST-based event log added in a future phase.
+BUS_EVENT_TTL = int(os.environ.get("BUS_EVENT_TTL", "3600"))
+
+# ── Phase 4B.4: TUI ───────────────────────────────────────────────────────────
+# Default orchestrator URL for the TUI client. Override with AICAF_URL env var
+# to point the TUI at a remote GPU server.
+AICAF_URL = os.environ.get("AICAF_URL", "http://localhost:9000")
+
+# ── Roles ─────────────────────────────────────────────────────────────────────
+# Canonical list used by model_registry, routing_policy, and TUI
+ALL_ROLES: list[str] = ["architect", "coder", "reviewer", "tester", "documenter"]

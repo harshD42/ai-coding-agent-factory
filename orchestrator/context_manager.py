@@ -6,6 +6,14 @@ Phase 3.4 addition:
     skills collection tagged type=antipattern. Injected as a
     "## Known Pitfalls" section so agents know what NOT to do.
 
+Phase 4A.1 change:
+    build_prompt() accepts an optional `model` parameter. When provided,
+    the token budget ceiling is set from model_registry.get_context_length(model)
+    instead of the global MAX_CONTEXT_TOKENS constant. This prevents context
+    overflow when a 32k-context model is assigned to an agent while the global
+    constant is set higher. Backwards-compatible: callers that omit `model`
+    continue to use MAX_CONTEXT_TOKENS.
+
 Priority tiers (never cut → cut first):
     P1   Current task + agent system prompt           [never cut]
     P2   Relevant codebase chunks (AST-aware)         [never cut]
@@ -16,6 +24,7 @@ Priority tiers (never cut → cut first):
 """
 
 import logging
+from typing import Optional
 
 import httpx
 
@@ -41,21 +50,27 @@ class ContextManager:
     async def build_prompt(
         self,
         *,
-        task:               str,
-        system_prompt:      str,
-        conversation:       list[dict],
-        session_id:         str  = "default",
-        include_codebase:   bool = True,
-        include_memories:   bool = True,
-        include_antipatterns: bool = True,   # Step 3.4
+        task:                 str,
+        system_prompt:        str,
+        conversation:         list[dict],
+        session_id:           str  = "default",
+        include_codebase:     bool = True,
+        include_memories:     bool = True,
+        include_antipatterns: bool = True,
+        model:                str  = "",    # Phase 4A.1 — per-model context budget
     ) -> list[dict]:
         """
         Build a token-bounded message list ready to send to a model.
+
+        Phase 4A.1: when `model` is provided, the token budget is derived from
+        that model's context_length in the ModelRegistry rather than the global
+        MAX_CONTEXT_TOKENS constant. Falls back to MAX_CONTEXT_TOKENS if the
+        registry is not yet initialised or the model is unknown.
         """
-        budget = config.MAX_CONTEXT_TOKENS - RESPONSE_BUDGET
+        budget = _resolve_token_budget(model)
 
         # P1: system prompt + task
-        p1       = _build_system_block(system_prompt, task)
+        p1        = _build_system_block(system_prompt, task)
         p1_tokens = count_tokens(p1)
 
         # P2: codebase context (AST-aware via memory_manager.search_codebase)
@@ -65,10 +80,16 @@ class ContextManager:
             if chunks:
                 p2 = _format_codebase_context(chunks)
 
-        # P2.5: anti-pattern warnings (Step 3.4)
+        # P2.5: anti-pattern warnings (Phase 3.4)
+        # Only inject antipatterns with confidence >= 0.6 (Phase 4A.3 addition)
         p2_5 = ""
         if include_antipatterns and task:
             antipatterns = await self._mem.search_antipatterns(task, k=ANTIPATTERN_K)
+            # Filter by confidence score written by session_hooks (Phase 4A.3)
+            antipatterns = [
+                ap for ap in antipatterns
+                if ap.get("metadata", {}).get("confidence", 1.0) >= 0.6
+            ]
             if antipatterns:
                 p2_5 = _format_antipattern_context(antipatterns)
 
@@ -92,7 +113,10 @@ class ContextManager:
 
         remaining = budget - system_tokens
         if remaining < 512:
-            log.warning("System context too large (%d tokens), dropping memories", system_tokens)
+            log.warning(
+                "system context too large (%d tokens, budget %d), dropping memories",
+                system_tokens, budget,
+            )
             system_content = sanitize_context(
                 p1
                 + (f"\n\n{p2}"   if p2   else "")
@@ -105,8 +129,8 @@ class ContextManager:
 
         total = count_tokens(system_content) + count_messages_tokens(messages)
         log.debug(
-            "build_prompt: system=%d conv_msgs=%d total_est=%d budget=%d",
-            system_tokens, len(messages), total, budget,
+            "build_prompt: model=%s budget=%d system=%d conv_msgs=%d total_est=%d",
+            model or "global", budget, system_tokens, len(messages), total,
         )
         return [{"role": "system", "content": system_content}] + messages
 
@@ -140,6 +164,32 @@ class ContextManager:
             return text[:2000] + "... [truncated]"
 
 
+# ── Token budget resolution ───────────────────────────────────────────────────
+
+def _resolve_token_budget(model: str) -> int:
+    """
+    Phase 4A.1: derive token budget from model's context_length in the registry
+    when a model name is provided. Falls back to config.MAX_CONTEXT_TOKENS if:
+      - model is empty string (legacy callers)
+      - registry is not yet initialised
+      - model is not in the catalog (logs a warning)
+    """
+    if not model:
+        return config.MAX_CONTEXT_TOKENS - RESPONSE_BUDGET
+
+    try:
+        from model_registry import get_model_registry
+        ctx_len = get_model_registry().get_context_length(model)
+        return ctx_len - RESPONSE_BUDGET
+    except RuntimeError:
+        # Registry not initialised yet — safe fallback during tests or early startup
+        log.debug("model_registry not initialised, using MAX_CONTEXT_TOKENS for budget")
+        return config.MAX_CONTEXT_TOKENS - RESPONSE_BUDGET
+    except Exception as e:
+        log.warning("failed to resolve context length for model %r: %s", model, e)
+        return config.MAX_CONTEXT_TOKENS - RESPONSE_BUDGET
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _build_system_block(system_prompt: str, task: str) -> str:
@@ -164,11 +214,14 @@ def _format_codebase_context(chunks: list[dict]) -> str:
 
 
 def _format_antipattern_context(antipatterns: list[dict]) -> str:
-    """Step 3.4: inject anti-pattern warnings into the system prompt."""
+    """Phase 3.4: inject anti-pattern warnings into the system prompt."""
     lines = ["## Known Pitfalls — Avoid These"]
     for ap in antipatterns:
-        name = ap.get("metadata", {}).get("name", "antipattern")
-        lines.append(f"\n⚠️  **{name}**\n{ap['content'].strip()}")
+        meta = ap.get("metadata", {})
+        name = meta.get("name", "antipattern")
+        conf = meta.get("confidence", 1.0)
+        conf_str = f" (confidence: {conf:.0%})" if conf < 1.0 else ""
+        lines.append(f"\n⚠️  **{name}**{conf_str}\n{ap['content'].strip()}")
     return "\n".join(lines)
 
 

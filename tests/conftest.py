@@ -28,6 +28,27 @@ os.environ.setdefault("MAX_AGENT_RUNTIME",  "300")
 os.environ.setdefault("WORKSPACE_DIR",      "/tmp/test_workspace")
 
 
+# ── Phase 4A.1: model registry isolation ─────────────────────────────────────
+# Reset the registry singleton before every test that touches model_registry.
+# Uses getattr with a sentinel so it's safe even on first import before
+# init_model_registry() has ever been called (attribute may not exist yet).
+
+@pytest.fixture(autouse=True)
+def _reset_model_registry():
+    """
+    Auto-use fixture: resets ModelRegistry singleton between every test.
+    Prevents state leaking from one test's init_model_registry() call into
+    the next test's get_model_registry() call.
+    """
+    import model_registry as mr
+    original = getattr(mr, "_registry", None)
+    mr._registry = None
+    yield
+    mr._registry = original
+
+
+# ── Shared data fixtures ──────────────────────────────────────────────────────
+
 @pytest.fixture
 def sample_diff():
     return (
@@ -53,8 +74,8 @@ def sample_messages():
 @pytest.fixture
 def sample_tasks():
     return [
-        {"id": "t1", "role": "coder",   "desc": "Write add function",  "deps": []},
-        {"id": "t2", "role": "tester",  "desc": "Write tests for add", "deps": ["t1"]},
-        {"id": "t3", "role": "coder",   "desc": "Write sub function",  "deps": []},
-        {"id": "t4", "role": "documenter", "desc": "Write README",     "deps": ["t1", "t3"]},
+        {"id": "t1", "role": "coder",      "desc": "Write add function",  "deps": []},
+        {"id": "t2", "role": "tester",     "desc": "Write tests for add", "deps": ["t1"]},
+        {"id": "t3", "role": "coder",      "desc": "Write sub function",  "deps": []},
+        {"id": "t4", "role": "documenter", "desc": "Write README",        "deps": ["t1", "t3"]},
     ]

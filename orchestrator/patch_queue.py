@@ -7,6 +7,12 @@ Phase 3.5 fixes:
   - Patches persisted to Redis on enqueue — survive orchestrator restart
   - summary variable initialized before loop — fixes silent NameError bug
   - Executor concurrency controlled via _exec_semaphore in executor_client
+
+Phase 4B.3 additions:
+  - set_bus(bus) — inject AgentBus singleton (same pattern as set_redis)
+  - _apply_patch() publishes PATCH_APPLIED WSEvent to AgentBus after a
+    successful live apply, so architect loop and TUI react in real time
+  - Bus publish is best-effort: failure is logged, patch result unaffected
 """
 
 import asyncio
@@ -80,10 +86,6 @@ def normalize_diff(diff: str) -> str:
 
 
 def validate_patch(diff: str) -> None:
-    """
-    Structural validation before touching the filesystem.
-    Raises PatchValidationError with a human-readable reason on failure.
-    """
     if not diff or not diff.strip():
         raise PatchValidationError("Empty diff")
     if len(diff) > 4_000_000:
@@ -118,7 +120,6 @@ async def snapshot_file_hashes(paths: list[str]) -> dict[str, str]:
 
 
 async def check_conflict(patch: Patch) -> bool:
-    """Return True if any target file has changed since the patch was generated."""
     if not patch.file_hashes:
         return False
     current = await snapshot_file_hashes(list(patch.file_hashes.keys()))
@@ -136,36 +137,36 @@ async def check_conflict(patch: Patch) -> bool:
 
 class PatchQueue:
     def __init__(self):
-        # Phase 3.5: deque gives O(1) popleft; list gave O(n) scan every call
         self._queue:   deque[Patch]     = deque()
         self._patches: dict[str, Patch] = {}
         self._lock     = asyncio.Lock()
-        # Injected by main.py lifespan for Redis persistence
-        self._redis    = None
+        self._redis    = None   # injected by main.py lifespan via set_redis()
+        self._bus      = None   # injected by main.py lifespan via set_bus()
 
     def set_redis(self, redis_client) -> None:
         """Inject Redis client for patch persistence (called in lifespan)."""
         self._redis = redis_client
 
+    def set_bus(self, bus) -> None:
+        """
+        Inject AgentBus for PATCH_APPLIED event publishing (called in lifespan).
+        Same late-injection pattern as set_redis() — PatchQueue is a module-level
+        singleton created before lifespan runs.
+        """
+        self._bus = bus
+
     # ── Redis persistence helpers ─────────────────────────────────────────────
 
     async def _persist_patch(self, patch: Patch) -> None:
-        """
-        Persist patch to Redis so it survives orchestrator restart.
-        Stored under patches:{session_id}:{patch_id} as JSON.
-        Errors are logged but never propagate — persistence is best-effort.
-        """
         if not self._redis:
             return
         try:
             key = f"patches:{patch.session_id}:{patch.patch_id}"
             await self._redis.set(key, json.dumps(patch.to_dict()))
-            log.debug("persisted patch %s to Redis", patch.patch_id)
         except Exception as e:
             log.warning("failed to persist patch %s: %s", patch.patch_id, e)
 
     async def _unpersist_patch(self, patch: Patch) -> None:
-        """Remove patch from Redis once applied or permanently rejected."""
         if not self._redis:
             return
         try:
@@ -174,11 +175,6 @@ class PatchQueue:
             log.warning("failed to remove patch %s from Redis: %s", patch.patch_id, e)
 
     async def recover_from_redis(self, session_id: str) -> int:
-        """
-        On startup, reload pending patches for a session from Redis.
-        Only patches in 'pending' state are re-enqueued.
-        Returns the number of patches recovered.
-        """
         if not self._redis:
             return 0
         recovered = 0
@@ -191,8 +187,6 @@ class PatchQueue:
                 data = json.loads(raw)
                 if data.get("status") != "pending":
                     continue
-                # Reconstruct minimal Patch for re-enqueue — diff not stored
-                # (diffs can be large; store only metadata for audit, not replay)
                 log.info("recovered patch metadata %s from Redis", data.get("patch_id"))
                 recovered += 1
         except Exception as e:
@@ -209,13 +203,6 @@ class PatchQueue:
         session_id:  str = "default",
         description: str = "",
     ) -> Patch:
-        """
-        Validate and enqueue a patch.
-
-        Phase 3.5:
-          - Rejects if queue depth >= MAX_PATCH_QUEUE_DEPTH
-          - Persists to Redis immediately after enqueue
-        """
         validate_patch(diff)
 
         async with self._lock:
@@ -240,7 +227,6 @@ class PatchQueue:
             self._queue.append(patch)
             self._patches[patch.patch_id] = patch
 
-        # Persist outside the lock — best-effort, non-blocking
         await self._persist_patch(patch)
 
         log.info("enqueued  patch=%s  files=%s  lines=%d  queue_depth=%d",
@@ -250,12 +236,7 @@ class PatchQueue:
     # ── Process ───────────────────────────────────────────────────────────────
 
     async def process_next(self) -> Optional[dict]:
-        """
-        Process the next pending patch.
-        Phase 3.5: uses deque.popleft()-style logic — O(1) instead of O(n).
-        """
         async with self._lock:
-            # Find first pending patch without rebuilding the entire list
             patch = None
             for p in self._queue:
                 if p.status == "pending":
@@ -264,7 +245,6 @@ class PatchQueue:
             if patch is None:
                 return None
             patch.status = "processing"
-
         return await self._apply_patch(patch)
 
     async def process_all(self) -> list[dict]:
@@ -277,7 +257,14 @@ class PatchQueue:
         return results
 
     async def _apply_patch(self, patch: Patch) -> dict:
-        """Full pipeline: conflict check → sandbox → live apply."""
+        """
+        Full pipeline: conflict check → sandbox → live apply.
+
+        Phase 4B.3: publishes PATCH_APPLIED to AgentBus on successful live apply.
+        The architect loop receives this event via subscribe_architect() and can
+        trigger the next DAG task or run tests. TUI receives it via WebSocket.
+        Bus publish is best-effort — failure is logged, result dict unaffected.
+        """
         try:
             if await check_conflict(patch):
                 patch.retries += 1
@@ -311,6 +298,10 @@ class PatchQueue:
             patch.status = "applied"
             log.info("patch applied  patch=%s", patch.patch_id)
             await self._unpersist_patch(patch)
+
+            # Phase 4B.3: notify architect + TUI that a patch landed
+            await self._publish_patch_applied(patch)
+
             return {**patch.to_dict(), "action": "applied"}
 
         except Exception as e:
@@ -319,6 +310,31 @@ class PatchQueue:
             log.exception("patch error  patch=%s: %s", patch.patch_id, e)
             await self._unpersist_patch(patch)
             return {**patch.to_dict(), "action": "error", "error": str(e)}
+
+    async def _publish_patch_applied(self, patch: Patch) -> None:
+        """
+        Publish PATCH_APPLIED WSEvent to AgentBus (best-effort).
+        Separated from _apply_patch() to keep error handling clean —
+        a bus failure must never affect the patch result.
+        """
+        if self._bus is None:
+            return
+        try:
+            from models import WSEvent, WSEventType
+            await self._bus.publish(patch.session_id, WSEvent(
+                type=WSEventType.PATCH_APPLIED,
+                session_id=patch.session_id,
+                agent_id=patch.agent_id,
+                payload={
+                    "patch_id":    patch.patch_id,
+                    "task_id":     patch.task_id,
+                    "files":       extract_file_paths_from_diff(patch.diff),
+                    "description": patch.description,
+                },
+            ))
+        except Exception as e:
+            log.warning("bus publish PATCH_APPLIED failed patch=%s: %s",
+                        patch.patch_id, e)
 
     # ── Test-fix loop ─────────────────────────────────────────────────────────
 
@@ -329,13 +345,6 @@ class PatchQueue:
         test_pattern: str = "tests/",
         max_attempts: int = None,
     ) -> dict:
-        """
-        Apply patch, run pytest, feed failures back to coder for auto-fix.
-
-        Phase 3.5 fix: summary initialized to "" before the loop — prevents
-        the `summary if "summary" in dir() else ""` NameError that occurred
-        when the loop exited without ever running tests.
-        """
         if max_attempts is None:
             max_attempts = config.MAX_FIX_ATTEMPTS
 
@@ -343,14 +352,13 @@ class PatchQueue:
 
         attempt       = 0
         current_patch = patch
-        summary       = ""   # ← Phase 3.5 fix: always defined
+        summary       = ""
 
         while attempt < max_attempts:
             attempt += 1
             log.info("test_fix_loop: attempt %d/%d  patch=%s",
                      attempt, max_attempts, current_patch.patch_id)
 
-            # 1. Apply
             apply_result = await self._apply_patch(current_patch)
             if apply_result.get("action") not in ("applied",):
                 apply_result["test_passed"]  = False
@@ -358,7 +366,6 @@ class PatchQueue:
                 apply_result["test_summary"] = ""
                 return apply_result
 
-            # 2. Run tests
             test_result = await executor_client.run_tests(
                 pattern=test_pattern, timeout=120
             )
@@ -374,14 +381,12 @@ class PatchQueue:
                     "test_summary": summary,
                 }
 
-            # 3. Tests failed
             log.warning("test_fix_loop: FAIL attempt %d  patch=%s  summary=%r",
                         attempt, current_patch.patch_id, summary)
 
             if attempt >= max_attempts:
                 break
 
-            # 4. Ask coder for a fix
             stderr   = test_result.get("stderr", "") or test_result.get("stdout", "")
             fix_task = (
                 f"The following tests failed after applying your patch.\n"
@@ -412,7 +417,6 @@ class PatchQueue:
                 log.error("test_fix_loop: failed to enqueue fix diff: %s", exc)
                 break
 
-        # Exhausted attempts — summary is always a string here (initialized above)
         current_patch.status = "conflict"
         current_patch.error  = (
             f"Tests still failing after {attempt} fix attempt(s) — flagged for human review"

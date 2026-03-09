@@ -7,6 +7,13 @@ Phase 3 additions:
        to produce an anti-pattern skill which is saved to ChromaDB with
        metadata type=antipattern.
   3.2  record_training_example() called when a patch is applied + tests pass.
+
+Phase 4A.3 addition:
+  Confidence scoring on skill and antipattern extraction. The extracting
+  model is asked to self-rate confidence (0.0–1.0). This score is stored
+  in ChromaDB metadata so context_manager can filter low-confidence items
+  (threshold 0.6) from agent prompts. Items without a confidence field
+  default to 1.0 (trusted) for backwards compatibility.
 """
 
 import logging
@@ -18,7 +25,7 @@ import httpx
 
 import config
 from memory_manager import MemoryManager
-from fine_tune_collector import record_success as ft_record   # Step 3.2
+from fine_tune_collector import record_success as ft_record
 
 log = logging.getLogger("session_hooks")
 
@@ -66,13 +73,12 @@ class SessionHooks:
                 approach=f.get("approach", ""),
             )
 
-        skill         = None
-        antipattern   = None
+        skill       = None
+        antipattern = None
 
         if transcript:
             skill = await self.extract_skills(session_id, transcript)
 
-        # Step 3.4: mine failure patterns after recording failures
         if failures:
             antipattern = await self._mine_failure_patterns(session_id, summary)
 
@@ -137,6 +143,14 @@ class SessionHooks:
     async def extract_skills(
         self, session_id: str, transcript: list[dict]
     ) -> Optional[str]:
+        """
+        Review the transcript and extract a reusable engineering pattern if one
+        emerged.
+
+        Phase 4A.3: the model is asked to self-rate extraction confidence
+        (0.0–1.0). This is stored in ChromaDB metadata so context_manager
+        can filter low-confidence items (threshold 0.6) from agent prompts.
+        """
         if not transcript:
             return None
 
@@ -152,7 +166,8 @@ class SessionHooks:
             "or best practice emerged that would be worth remembering for future sessions.\n\n"
             "If yes, respond with:\n"
             "SKILL_NAME: <short name>\n"
-            "SKILL_CONTENT: <description of the pattern, 2-5 sentences>\n\n"
+            "SKILL_CONTENT: <description of the pattern, 2-5 sentences>\n"
+            "CONFIDENCE: <float 0.0-1.0 — how confident you are this is genuinely reusable>\n\n"
             "If no clear reusable pattern emerged, respond with: NO_SKILL\n\n"
             f"Conversation:\n{condensed}"
         )
@@ -175,10 +190,17 @@ class SessionHooks:
 
             skill_name    = _parse_field(text, "SKILL_NAME")
             skill_content = _parse_field(text, "SKILL_CONTENT")
+            confidence    = _parse_confidence(text)   # Phase 4A.3
 
             if skill_name and skill_content:
-                await self._mem.save_skill(skill_name, skill_content)
-                log.info("skill extracted: %s", skill_name)
+                await self._mem.save_skill(
+                    skill_name,
+                    skill_content,
+                    metadata={"confidence": confidence},   # Phase 4A.3
+                )
+                log.info(
+                    "skill extracted: %s  confidence=%.2f", skill_name, confidence
+                )
                 return skill_name
 
         except Exception as e:
@@ -194,12 +216,9 @@ class SessionHooks:
         Check if enough similar failures have accumulated to extract an
         anti-pattern skill.
 
-        Flow:
-          1. cluster_failures() groups recent failures semantically.
-          2. For each cluster >= N_FAILURES_THRESHOLD, ask the model to
-             describe what NOT to do.
-          3. Save as a skill with type=antipattern.
-          4. Return the first new anti-pattern name, or None.
+        Phase 4A.3: confidence scoring applied to extracted antipatterns.
+        Same 0.0–1.0 scale, stored in metadata, filtered at 0.6 in
+        context_manager.
         """
         threshold = config.N_FAILURES_THRESHOLD
         try:
@@ -214,7 +233,6 @@ class SessionHooks:
             if len(cluster) < threshold:
                 continue
 
-            # Build a summary of the cluster for the model
             examples = "\n\n".join(
                 f"Failure {i+1}:\n{f['content'][:400]}"
                 for i, f in enumerate(cluster[:5])
@@ -225,7 +243,8 @@ class SessionHooks:
                 "Identify the common anti-pattern and describe what to AVOID in future.\n\n"
                 "Respond with:\n"
                 "ANTIPATTERN_NAME: <short name>\n"
-                "ANTIPATTERN_CONTENT: <what to avoid and why, 2-5 sentences>\n\n"
+                "ANTIPATTERN_CONTENT: <what to avoid and why, 2-5 sentences>\n"
+                "CONFIDENCE: <float 0.0-1.0 — how confident you are this is a real pattern>\n\n"
                 "If these failures don't share a clear pattern, respond: NO_PATTERN\n\n"
                 f"Examples:\n{examples}"
             )
@@ -248,14 +267,22 @@ class SessionHooks:
 
                 ap_name    = _parse_field(text, "ANTIPATTERN_NAME")
                 ap_content = _parse_field(text, "ANTIPATTERN_CONTENT")
+                confidence = _parse_confidence(text)   # Phase 4A.3
 
                 if ap_name and ap_content:
                     await self._mem.save_skill(
                         name=f"antipattern:{ap_name}",
                         content=ap_content,
-                        metadata={"type": "antipattern", "cluster_size": len(cluster)},
+                        metadata={
+                            "type":         "antipattern",
+                            "cluster_size": len(cluster),
+                            "confidence":   confidence,   # Phase 4A.3
+                        },
                     )
-                    log.info("antipattern mined: %s (cluster_size=%d)", ap_name, len(cluster))
+                    log.info(
+                        "antipattern mined: %s  cluster_size=%d  confidence=%.2f",
+                        ap_name, len(cluster), confidence,
+                    )
                     return ap_name
 
             except Exception as e:
@@ -271,6 +298,25 @@ def _parse_field(text: str, field: str) -> str:
         if line.strip().upper().startswith(f"{field}:"):
             return line.split(":", 1)[1].strip()
     return ""
+
+
+def _parse_confidence(text: str) -> float:
+    """
+    Phase 4A.3: parse CONFIDENCE field from model response.
+
+    Returns a float in [0.0, 1.0]. Defaults to 0.8 if the field is
+    missing or unparseable — a moderate trust level that passes the
+    context_manager threshold (0.6) without claiming full certainty.
+    """
+    raw = _parse_field(text, "CONFIDENCE")
+    if not raw:
+        return 0.8   # default: moderate confidence
+    try:
+        val = float(raw)
+        return max(0.0, min(1.0, val))   # clamp to valid range
+    except (ValueError, TypeError):
+        log.debug("_parse_confidence: could not parse %r, defaulting to 0.8", raw)
+        return 0.8
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

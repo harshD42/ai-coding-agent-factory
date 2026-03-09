@@ -14,17 +14,21 @@ Redis pub/sub:
     Channel "filewatch:events" receives JSON messages:
         {"event": "modified"|"created"|"deleted", "path": "relative/path"}
 
+Phase 4A.3 additions:
+    - 500ms debounce on raw file events — editors (VS Code, vim) trigger
+      multiple write events per save (temp file, swap file, actual write).
+      Without debouncing a single save causes 3-5 redundant reindex calls.
+      Implementation: per-path asyncio.TimerHandle coalescing window.
+    - Commit-based reindex trigger — raw file events still update the hash
+      registry and pub/sub (used by conflict detection), but indexing is
+      no longer triggered directly by file changes. Instead, a
+      "codebase_updated" event is published after a successful git commit
+      in patch_queue. This guarantees the codebase index always reflects
+      a complete committed state, never a half-applied patch.
+
 Lifecycle:
     Call start() once in the FastAPI lifespan (after Redis is connected).
     Call stop()  in the shutdown hook.
-
-Notes:
-    - The orchestrator mounts /workspace read-only, so we watch the path
-      that is available to the orchestrator container: /workspace.
-    - Hash computation reads the file from disk directly (not via executor)
-      because the orchestrator has read-only access to the same volume.
-    - watchdog is CPU-light (inotify on Linux, FSEvents on macOS).
-    - This is the ONLY new file introduced in Phase 2.
 """
 
 import asyncio
@@ -53,6 +57,9 @@ REGISTRY_KEY     = "filewatch:hashes"
 EVENT_CHANNEL    = "filewatch:events"
 SKIP_EXTENSIONS  = {".pyc", ".pyo", ".swp", ".tmp", ".log"}
 SKIP_DIRS        = {".git", "__pycache__", "node_modules", ".venv"}
+
+# Phase 4A.3: debounce window in seconds — coalesces rapid editor write events
+DEBOUNCE_SECONDS = 0.5
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -85,7 +92,7 @@ def _sha256(path: str) -> Optional[str]:
 class _Handler(FileSystemEventHandler if _WATCHDOG_AVAILABLE else object):
     """
     Receives watchdog filesystem events and queues them for async processing.
-    We use a thread-safe queue because watchdog runs on a background thread.
+    Uses a thread-safe queue because watchdog runs on a background thread.
     """
 
     def __init__(self, event_queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
@@ -128,20 +135,29 @@ class FileWatcher:
     """
     Watches /workspace and keeps a Redis hash registry up to date.
 
+    Phase 4A.3: raw file events are debounced (500ms) before processing.
+    Indexing is NOT triggered by file events — only by explicit
+    publish_codebase_updated() calls (made after successful git commits).
+
     Usage:
         watcher = FileWatcher()
-        await watcher.start(redis_client)   # call in lifespan startup
+        await watcher.start(redis_client)
         ...
-        await watcher.stop()                # call in lifespan shutdown
+        await watcher.publish_codebase_updated()  # called by patch_queue
+        ...
+        await watcher.stop()
     """
 
     def __init__(self, watch_path: str = WATCH_PATH):
-        self._watch_path = watch_path
-        self._redis:    Optional[aioredis.Redis] = None
-        self._observer: Optional["Observer"]     = None
-        self._worker:   Optional[asyncio.Task]   = None
-        self._queue:    asyncio.Queue            = asyncio.Queue()
-        self._running   = False
+        self._watch_path  = watch_path
+        self._redis:      Optional[aioredis.Redis] = None
+        self._observer:   Optional["Observer"]     = None
+        self._worker:     Optional[asyncio.Task]   = None
+        self._queue:      asyncio.Queue            = asyncio.Queue()
+        self._running     = False
+
+        # Phase 4A.3: debounce state — path → pending asyncio.Handle
+        self._pending_debounce: dict[str, asyncio.TimerHandle] = {}
 
     async def start(self, redis_client: aioredis.Redis) -> None:
         """
@@ -158,27 +174,29 @@ class FileWatcher:
         self._redis   = redis_client
         self._running = True
 
-        # Initial scan
         await self._full_scan()
         log.info("file_watcher: initial scan complete")
 
-        # Start watchdog observer on a daemon thread
         loop    = asyncio.get_event_loop()
         handler = _Handler(self._queue, loop)
         self._observer = Observer()
         self._observer.schedule(handler, self._watch_path, recursive=True)
         self._observer.start()
-        log.info("file_watcher: watching %s", self._watch_path)
+        log.info("file_watcher: watching %s (debounce=%.1fs)", self._watch_path, DEBOUNCE_SECONDS)
 
-        # Async worker drains the event queue and updates Redis
         self._worker = asyncio.create_task(self._event_worker())
 
     async def stop(self) -> None:
         """Stop the watcher cleanly."""
         self._running = False
+
+        # Cancel any pending debounce handles
+        for handle in self._pending_debounce.values():
+            handle.cancel()
+        self._pending_debounce.clear()
+
         if self._observer:
             self._observer.stop()
-            # Join on a thread pool executor to avoid blocking the event loop
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._observer.join)
         if self._worker:
@@ -189,14 +207,33 @@ class FileWatcher:
                 pass
         log.info("file_watcher: stopped")
 
+    # ── Phase 4A.3: Commit-based reindex signal ───────────────────────────────
+
+    async def publish_codebase_updated(self) -> None:
+        """
+        Publish a 'codebase_updated' event to signal that a git commit has
+        landed and the codebase index should be refreshed.
+
+        Called by patch_queue after a successful git apply + commit.
+        The orchestrator's /v1/index endpoint (or background task in 4B)
+        subscribes to this and triggers memory_manager.index_codebase().
+
+        This separation guarantees the index always reflects a complete
+        committed state — never a half-applied patch or an editor temp file.
+        """
+        if not self._redis:
+            return
+        msg = json.dumps({"event": "codebase_updated"})
+        await self._redis.publish(EVENT_CHANNEL, msg)
+        log.info("file_watcher: codebase_updated published")
+
     # ── Redis helpers ─────────────────────────────────────────────────────────
 
     async def get_hash(self, rel_path: str) -> Optional[str]:
         """Return the current hash for a relative path, or None if unknown."""
         if not self._redis:
             return None
-        val = await self._redis.hget(REGISTRY_KEY, rel_path)
-        return val  # "DELETED" | sha256_hex | None
+        return await self._redis.hget(REGISTRY_KEY, rel_path)
 
     async def _set_hash(self, rel_path: str, value: str) -> None:
         await self._redis.hset(REGISTRY_KEY, rel_path, value)
@@ -217,22 +254,34 @@ class FileWatcher:
             log.warning("file_watcher: watch path does not exist: %s", self._watch_path)
             return
 
-        pipe = self._redis.pipeline()
+        pipe  = self._redis.pipeline()
         count = 0
         for p in root.rglob("*"):
             if p.is_file() and not _should_skip(str(p)):
-                rel  = _rel(str(p))
-                sha  = _sha256(str(p))
+                rel = _rel(str(p))
+                sha = _sha256(str(p))
                 if sha:
                     pipe.hset(REGISTRY_KEY, rel, sha)
                     count += 1
         await pipe.execute()
         log.info("file_watcher: indexed %d files", count)
 
-    # ── Event worker ──────────────────────────────────────────────────────────
+    # ── Event worker with debounce ────────────────────────────────────────────
 
     async def _event_worker(self) -> None:
-        """Drain the event queue and sync each change to Redis."""
+        """
+        Drain the event queue and sync each change to Redis.
+
+        Phase 4A.3: events are debounced per path. If multiple events arrive
+        for the same path within DEBOUNCE_SECONDS, only the final one is
+        processed. This prevents 3-5 redundant hash updates per editor save.
+
+        Hash registry and pub/sub are still updated on every debounced event —
+        these are lightweight and needed for conflict detection. Reindexing
+        is NOT triggered here; it happens via publish_codebase_updated() only.
+        """
+        loop = asyncio.get_event_loop()
+
         while self._running:
             try:
                 event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
@@ -241,21 +290,42 @@ class FileWatcher:
 
             path     = event["path"]
             evt_type = event["event"]
-            rel      = _rel(path)
 
-            if evt_type == "deleted":
-                await self._del_hash(rel)
-                await self._publish("deleted", rel)
-                log.debug("file_watcher: deleted  %s", rel)
-            else:
-                # modified or created
-                sha = await asyncio.get_event_loop().run_in_executor(
-                    None, _sha256, path
-                )
-                if sha:
-                    await self._set_hash(rel, sha)
-                    await self._publish(evt_type, rel)
-                    log.debug("file_watcher: %s  %s  %s", evt_type, rel, sha[:8])
+            # Cancel any existing debounce handle for this path
+            existing = self._pending_debounce.pop(path, None)
+            if existing:
+                existing.cancel()
+
+            # Schedule debounced processing
+            handle = loop.call_later(
+                DEBOUNCE_SECONDS,
+                lambda p=path, e=evt_type: asyncio.ensure_future(
+                    self._process_event(p, e)
+                ),
+            )
+            self._pending_debounce[path] = handle
+
+    async def _process_event(self, path: str, evt_type: str) -> None:
+        """
+        Process a single debounced file event: update Redis hash registry
+        and publish to the event channel.
+
+        Does NOT trigger codebase reindexing — that is commit-driven only.
+        """
+        self._pending_debounce.pop(path, None)
+        rel = _rel(path)
+
+        if evt_type == "deleted":
+            await self._del_hash(rel)
+            await self._publish("deleted", rel)
+            log.debug("file_watcher: deleted  %s", rel)
+        else:
+            loop = asyncio.get_event_loop()
+            sha  = await loop.run_in_executor(None, _sha256, path)
+            if sha:
+                await self._set_hash(rel, sha)
+                await self._publish(evt_type, rel)
+                log.debug("file_watcher: %s  %s  %s", evt_type, rel, sha[:8])
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

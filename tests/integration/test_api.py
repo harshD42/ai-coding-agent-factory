@@ -5,7 +5,7 @@ These tests require the Docker stack to be running:
     docker compose --profile laptop up -d
 
 Run with:
-    pytest tests/integration/ -v --timeout=60
+    INTEGRATION_TESTS=1 pytest tests/integration/ -v --timeout=60
 
 Skipped automatically in CI (no real services available).
 """
@@ -14,8 +14,6 @@ import os
 import pytest
 import httpx
 
-# Skip all integration tests if INTEGRATION_TESTS env var is not set
-# This prevents them from running in unit-test-only CI jobs
 pytestmark = pytest.mark.skipif(
     os.environ.get("INTEGRATION_TESTS") != "1",
     reason="Set INTEGRATION_TESTS=1 to run integration tests (requires Docker stack)"
@@ -41,6 +39,12 @@ class TestOrchestratorHealth:
         assert "profile" in data
         assert "version" in data
 
+    def test_version_at_least_040(self, client):
+        """Version must be >= 0.4.0 after Phase 4A."""
+        r = client.get(f"{ORCH_URL}/health")
+        assert r.status_code == 200
+        assert r.json()["version"] >= "0.4.0"
+
     def test_models_endpoint(self, client):
         r = client.get(f"{ORCH_URL}/v1/models")
         assert r.status_code == 200
@@ -60,9 +64,7 @@ class TestExecutorHealth:
         assert r.status_code == 200
         assert "files" in r.json()
 
-
     def test_execute_allowed_command(self, client):
-        # Use 'sh' which is in the whitelist — 'echo' alone is not
         r = client.post(f"{EXECUTOR_URL}/execute", json={"command": "sh -c 'echo hello'"})
         assert r.status_code == 200
         data = r.json()
@@ -79,10 +81,6 @@ class TestExecutorHealth:
         assert r.status_code == 400
 
     def test_patch_validation_bad_diff(self, client):
-        # The executor's /apply-patch does basic size/binary checks only.
-        # Structural diff validation (hunk headers etc) lives in the orchestrator's
-        # patch_queue.validate_patch(). A non-diff string passes HTTP validation
-        # but git apply rejects it — response is 200 with applied=false.
         r = client.post(
             f"{EXECUTOR_URL}/apply-patch",
             json={"diff": "this is not a diff", "target": "sandbox"}
@@ -103,7 +101,6 @@ class TestExecutorHealth:
             json={"diff": diff, "target": "sandbox"}
         )
         assert r.status_code == 200
-        # sandbox either passes or fails git apply, but doesn't 500
 
 
 class TestCommandInterception:
@@ -117,8 +114,7 @@ class TestCommandInterception:
             }
         )
         assert r.status_code == 200
-        data    = r.json()
-        content = data["choices"][0]["message"]["content"]
+        content = r.json()["choices"][0]["message"]["content"]
         assert "Status" in content or "status" in content
 
     def test_unknown_command_returns_help(self, client):
@@ -158,23 +154,38 @@ class TestMemoryEndpoints:
         assert "chunks" in data
 
     def test_save_and_recall(self, client):
-        # Save
+        """
+        Save a unique session entry and verify it appears in recall results.
+
+        Uses a highly specific marker with a fixed session_id so we can
+        verify the exact document was stored, not rely purely on semantic
+        similarity ranking which may return unrelated documents.
+        """
+        session_id = "integ-save-recall-unique"
+        marker     = "AICAF_INTEGRATION_UNIQUE_SAVE_RECALL_TEST_MARKER"
+
         r = client.post(
             f"{ORCH_URL}/v1/memory/save",
-            json={"session_id": "integ-test", "content": "Integration test memory entry XYZ123"}
+            json={
+                "session_id": session_id,
+                "content":    f"Integration test memory entry {marker}",
+            }
         )
         assert r.status_code == 200
         assert r.json()["saved"] is True
 
-        # Recall
-        r = client.get(f"{ORCH_URL}/v1/memory/recall?q=XYZ123")
+        # Query using the exact marker — should rank highest since it's unique
+        r = client.get(f"{ORCH_URL}/v1/memory/recall?q={marker}")
         assert r.status_code == 200
         results = r.json()["results"]
-        assert any("XYZ123" in res["content"] for res in results)
+        # Accept if found anywhere in the top results
+        assert any(marker in res.get("content", "") for res in results), \
+            f"Saved marker not found in recall. Top results: " \
+            f"{[res.get('content','')[:60] for res in results[:3]]}"
 
     def test_recall_empty_query_rejected(self, client):
         r = client.get(f"{ORCH_URL}/v1/memory/recall")
-        assert r.status_code == 422  # missing required query param
+        assert r.status_code == 422
 
 
 class TestPatchEndpoints:

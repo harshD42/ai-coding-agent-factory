@@ -11,35 +11,40 @@ Execution rules:
     - If a task fails, all transitive dependents are marked blocked
     - Independent ready tasks run concurrently (Step 2.6, capped by MAX_PARALLEL_AGENTS)
 
+Phase 4A.2 additions:
+    - Task leasing via Redis SETNX — prevents duplicate execution when the
+      orchestrator restarts mid-session with tasks already in-flight.
+      Key: task:{session_id}:{task_id}:lease  TTL: config.TASK_LEASE_TTL
+
 Redis key layout:
-    tasks:{session_id}:{task_id}  →  JSON task dict
-    tasklist:{session_id}         →  Redis list of task_ids (insertion order)
+    tasks:{session_id}:{task_id}            →  JSON task dict
+    tasklist:{session_id}                   →  Redis list of task_ids
+    task:{session_id}:{task_id}:lease       →  worker_id string (SETNX + TTL)
 """
 
 import asyncio
 import json
 import logging
+import uuid
 from typing import Optional
 
 import redis.asyncio as aioredis
 
 import config
 from agent_manager import AgentManager
-from utils import extract_diffs_from_result            # Step 2.1
+from utils import extract_diffs_from_result
 
 log = logging.getLogger("task_queue")
 
-# Roles whose output may contain patches that should be auto-applied.
-_PATCH_ROLES = {"coder", "tester"}                     # Step 2.1
+_PATCH_ROLES = {"coder", "tester"}
 
 
 class TaskQueue:
     def __init__(self):
         self._redis: Optional[aioredis.Redis] = None
-        # Injected after construction to avoid circular import (TaskQueue ↔ PatchQueue)
-        self._patch_queue = None                        # Step 2.1
+        self._patch_queue = None
 
-    def set_patch_queue(self, pq) -> None:             # Step 2.1
+    def set_patch_queue(self, pq) -> None:
         """Wire in the PatchQueue singleton after both objects are created."""
         self._patch_queue = pq
 
@@ -62,6 +67,9 @@ class TaskQueue:
     def _list_key(self, session_id: str) -> str:
         return f"tasklist:{session_id}"
 
+    def _lease_key(self, session_id: str, task_id: str) -> str:
+        return f"task:{session_id}:{task_id}:lease"
+
     async def _save_task(self, session_id: str, task: dict) -> None:
         await self._redis.set(self._task_key(session_id, task["id"]), json.dumps(task))
 
@@ -81,6 +89,29 @@ class TaskQueue:
                 tasks.append(t)
         return tasks
 
+    # ── Phase 4A.2: Task leasing ──────────────────────────────────────────────
+
+    async def _acquire_task_lease(
+        self, session_id: str, task_id: str, worker_id: str
+    ) -> bool:
+        """
+        Acquire an exclusive lease on a task using Redis SETNX.
+        Returns True if this worker now owns the task.
+        Returns False if another worker already holds the lease.
+
+        TTL is config.TASK_LEASE_TTL (default 600s). If the orchestrator
+        crashes mid-task, the lease expires and the task becomes retryable.
+        """
+        key    = self._lease_key(session_id, task_id)
+        result = await self._redis.set(
+            key, worker_id, nx=True, ex=config.TASK_LEASE_TTL
+        )
+        return result is True
+
+    async def _release_task_lease(self, session_id: str, task_id: str) -> None:
+        """Release the lease on task completion or failure."""
+        await self._redis.delete(self._lease_key(session_id, task_id))
+
     # ── Load plan ─────────────────────────────────────────────────────────────
 
     async def load_plan(self, session_id: str, tasks: list[dict]) -> dict:
@@ -88,6 +119,7 @@ class TaskQueue:
         old_ids = await self._all_task_ids(session_id)
         for tid in old_ids:
             await self._redis.delete(self._task_key(session_id, tid))
+            await self._redis.delete(self._lease_key(session_id, tid))
         await self._redis.delete(self._list_key(session_id))
 
         _validate_dag(tasks)
@@ -158,30 +190,19 @@ class TaskQueue:
                         changed = True
                         log.info("blocked task %s (depends on failed %s)", t["id"], failed_id)
 
-    # ── Step 2.1: Auto-patch helper ───────────────────────────────────────────
+    # ── Auto-patch helper ─────────────────────────────────────────────────────
 
     async def _auto_apply_patches(
         self, session_id: str, task: dict, output: str
     ) -> list[dict]:
-        """
-        Extract diffs from *output* and enqueue each via patch_queue.
-
-        Only fires for coder/tester roles when a patch_queue is injected.
-        Errors are logged but never propagate — a patch failure must not
-        corrupt the parent task's completion status.
-
-        Returns a list of enqueue result dicts for observability.
-        """
+        """Extract diffs from output and enqueue each via patch_queue."""
         if self._patch_queue is None:
             return []
         if task.get("role") not in _PATCH_ROLES:
             return []
-
         diffs = extract_diffs_from_result(output)
         if not diffs:
-            log.debug("task %s: no diffs found in output", task["id"])
             return []
-
         log.info("task %s: found %d diff(s), auto-enqueueing", task["id"], len(diffs))
         results = []
         for i, diff in enumerate(diffs, 1):
@@ -205,38 +226,26 @@ class TaskQueue:
 
     # ── Execute plan ──────────────────────────────────────────────────────────
 
-    async def execute_plan(
-        self, session_id: str, agent_mgr: AgentManager
-    ) -> dict:
+    async def execute_plan(self, session_id: str, agent_mgr: AgentManager) -> dict:
         """
         Execute all ready tasks until the plan is complete or stuck.
-
-        Step 2.1: diffs are auto-extracted and applied after each coder/tester task.
-        Step 2.6: independent ready tasks run concurrently (≤ MAX_PARALLEL_AGENTS).
+        Independent ready tasks run concurrently (≤ MAX_PARALLEL_AGENTS).
         """
         executed = []
-
         while True:
             ready = await self.get_ready_tasks(session_id)
             if not ready:
                 break
-
-            # Step 2.6: cap concurrency
             batch = ready[: config.MAX_PARALLEL_AGENTS]
-
-            # Mark all as running before launching concurrently
             for task in batch:
                 await self.update_status(session_id, task["id"], "running")
-
             task_coros = [
                 self._run_single_task(session_id, task, agent_mgr)
                 for task in batch
             ]
             batch_results = await asyncio.gather(*task_coros, return_exceptions=True)
-
             for task, res in zip(batch, batch_results):
                 if isinstance(res, Exception):
-                    # gather caught an unhandled exception from _run_single_task
                     log.error("unexpected error in task %s: %s", task["id"], res)
                     await self.update_status(
                         session_id, task["id"], "failed", result=str(res)
@@ -259,44 +268,58 @@ class TaskQueue:
         self, session_id: str, task: dict, agent_mgr: AgentManager
     ) -> dict:
         """
-        Run one task: spawn agent → auto-apply patches → update status.
-        Returns a task summary dict.
+        Run one task: acquire lease → spawn agent → auto-apply patches
+        → release lease → update status.
+
+        Phase 4A.2: lease acquisition prevents duplicate execution when the
+        orchestrator restarts mid-session. If another worker already holds
+        the lease for this task, we skip it cleanly.
         """
+        worker_id = uuid.uuid4().hex[:12]
+
+        # Acquire lease — skip if another worker beat us to it
+        if not await self._acquire_task_lease(session_id, task["id"], worker_id):
+            log.warning(
+                "task %s already leased by another worker, skipping", task["id"]
+            )
+            return {**task, "status": "skipped", "reason": "lease_held"}
+
         log.info("executing task %s (%s): %s",
                  task["id"], task["role"], task["desc"][:80])
 
-        result = await agent_mgr.spawn_and_run(
-            role=task["role"],
-            task=task["desc"],
-            session_id=session_id,
-        )
-
-        output = result.get("result", "") or ""
-
-        # Step 2.1 — auto-apply any diffs found in coder/tester output
-        patch_results = await self._auto_apply_patches(session_id, task, output)
-        patches_ok    = sum(1 for r in patch_results if "error" not in r)
-        patches_fail  = len(patch_results) - patches_ok
-
-        if result["status"] == "done":
-            await self.update_status(session_id, task["id"], "complete", result=output)
-            return {
-                **task,
-                "status":          "complete",
-                "patches_applied": patches_ok,
-                "patches_failed":  patches_fail,
-            }
-        else:
-            await self.update_status(
-                session_id, task["id"], "failed",
-                result=result.get("error", "unknown error"),
+        try:
+            result = await agent_mgr.spawn_and_run(
+                role=task["role"],
+                task=task["desc"],
+                session_id=session_id,
             )
-            return {
-                **task,
-                "status":          "failed",
-                "patches_applied": patches_ok,
-                "patches_failed":  patches_fail,
-            }
+            output        = result.get("result", "") or ""
+            patch_results = await self._auto_apply_patches(session_id, task, output)
+            patches_ok    = sum(1 for r in patch_results if "error" not in r)
+            patches_fail  = len(patch_results) - patches_ok
+
+            if result["status"] == "done":
+                await self.update_status(session_id, task["id"], "complete", result=output)
+                return {
+                    **task,
+                    "status":          "complete",
+                    "patches_applied": patches_ok,
+                    "patches_failed":  patches_fail,
+                }
+            else:
+                await self.update_status(
+                    session_id, task["id"], "failed",
+                    result=result.get("error", "unknown error"),
+                )
+                return {
+                    **task,
+                    "status":          "failed",
+                    "patches_applied": patches_ok,
+                    "patches_failed":  patches_fail,
+                }
+        finally:
+            # Always release lease — even on exception
+            await self._release_task_lease(session_id, task["id"])
 
 
 # ── DAG validation ────────────────────────────────────────────────────────────

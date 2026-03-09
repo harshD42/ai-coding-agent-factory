@@ -1,11 +1,12 @@
 """
 router.py — Health-aware routing to model endpoints with fallback chain.
 
-Routes requests to the correct model server based on role.
-Falls back to next healthy endpoint if the primary is down.
+Phase 3.5: non-streaming dispatch() wrapped in asyncio.wait_for(MODEL_CALL_TIMEOUT).
 
-Phase 3.5: non-streaming dispatch() wrapped in asyncio.wait_for(MODEL_CALL_TIMEOUT)
-— stalled vLLM/Ollama endpoint raises TimeoutError instead of hanging forever.
+Phase 4A.2: resolve_endpoint() now delegates to RoutingPolicy for all
+model/endpoint selection. Router stays thin — it owns HTTP dispatch logic
+only, not selection logic. The RoutingPolicy singleton is set via
+set_policy() called from main.py lifespan.
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import json
 import logging
 import time
 import uuid
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 import httpx
 
@@ -23,8 +24,17 @@ from models import ChatCompletionRequest
 log = logging.getLogger("router")
 
 _client = httpx.AsyncClient(timeout=300.0)
-_health_cache: dict[str, tuple[bool, float]] = {}  # url → (healthy, checked_at)
+_health_cache: dict[str, tuple[bool, float]] = {}   # url → (healthy, checked_at)
 HEALTH_CACHE_TTL = 30.0  # seconds
+
+# RoutingPolicy singleton — set by main.py lifespan via set_policy()
+_policy = None
+
+
+def set_policy(policy) -> None:
+    """Wire in the RoutingPolicy singleton. Called from main.py lifespan."""
+    global _policy
+    _policy = policy
 
 
 # ── Health checking ───────────────────────────────────────────────────────────
@@ -37,17 +47,15 @@ async def _is_healthy(base_url: str) -> bool:
         if now - checked_at < HEALTH_CACHE_TTL:
             return healthy
 
-    # Ollama health check
-    if "11434" in base_url or "ollama" in base_url:
+    if "11434" in base_url or "ollama" in base_url.lower():
         try:
-            r = await _client.get(f"{base_url.rstrip('/')}/api/tags", timeout=5.0)
+            r  = await _client.get(f"{base_url.rstrip('/')}/api/tags", timeout=5.0)
             ok = r.status_code == 200
         except Exception:
             ok = False
     else:
-        # vLLM health check
         try:
-            r = await _client.get(f"{base_url.rstrip('/')}/health", timeout=5.0)
+            r  = await _client.get(f"{base_url.rstrip('/')}/health", timeout=5.0)
             ok = r.status_code == 200
         except Exception:
             ok = False
@@ -58,48 +66,54 @@ async def _is_healthy(base_url: str) -> bool:
     return ok
 
 
-async def resolve_endpoint(role: str = "coder") -> tuple[str, str, str]:
+# ── Endpoint resolution ───────────────────────────────────────────────────────
+
+async def resolve_endpoint(
+    role: str = "coder",
+    session_id: str = "default",
+) -> tuple[str, str, str]:
     """
-    Return (endpoint_url, model_name, backend_type) for the given role,
-    falling back through FALLBACK_ORDER if the primary is unhealthy.
-    backend_type is 'ollama' or 'vllm'.
+    Return (endpoint_url, model_name, backend_type) for the given role.
+
+    Phase 4A.2: delegates to RoutingPolicy.resolve() for primary selection.
+    Falls back through FALLBACK_ORDER if the resolved endpoint is unhealthy.
     """
-    primary_url   = config.ROLE_ENDPOINTS.get(role, config.OLLAMA_URL)
-    primary_model = config.ROLE_MODELS.get(role, config.OLLAMA_MODEL)
+    if _policy is not None:
+        primary_url, primary_model, primary_btype = await _policy.resolve(role, session_id)
+    else:
+        # Fallback for tests or early startup where policy isn't wired yet
+        from routing_policy import _profile_endpoint, _profile_model, _backend_type
+        primary_url   = _profile_endpoint(role)
+        primary_model = _profile_model(role)
+        primary_btype = _backend_type(primary_url)
 
     if await _is_healthy(primary_url):
-        btype = "ollama" if ("11434" in primary_url or "ollama" in primary_url) else "vllm"
-        return primary_url, primary_model, btype
+        return primary_url, primary_model, primary_btype
 
     # Walk fallback chain
     for fallback_url in config.FALLBACK_ORDER:
         if fallback_url == primary_url:
             continue
         if await _is_healthy(fallback_url):
-            btype = "ollama" if ("11434" in fallback_url or "ollama" in fallback_url) else "vllm"
+            btype = "ollama" if ("11434" in fallback_url or "ollama" in fallback_url.lower()) else "vllm"
             model = config.OLLAMA_MODEL if btype == "ollama" else primary_model
-            log.warning("role=%s falling back to %s", role, fallback_url)
+            log.warning("role=%s session=%s falling back to %s", role, session_id, fallback_url)
             return fallback_url, model, btype
 
     # Nothing healthy — try primary anyway and let the error surface
-    log.error("no healthy endpoint found for role=%s, trying primary", role)
-    btype = "ollama" if ("11434" in primary_url or "ollama" in primary_url) else "vllm"
-    return primary_url, primary_model, btype
+    log.error("no healthy endpoint for role=%s session=%s, trying primary", role, session_id)
+    return primary_url, primary_model, primary_btype
 
 
 # ── Request builders ──────────────────────────────────────────────────────────
 
 def _build_ollama_body(messages: list[dict], model: str, req: ChatCompletionRequest) -> dict:
-    # Ollama only accepts: model, messages, stream, options
-    # Strip tool_calls, tool definitions, and any non-text content blocks
     clean_messages = []
     for m in messages:
         role    = m.get("role", "user")
         content = m.get("content", "")
-        # Skip tool-related roles Ollama doesn't support
         if role in ("tool", "function"):
             continue
-        # Flatten list content to string
         if isinstance(content, list):
             content = " ".join(
                 b.get("text", "") if isinstance(b, dict) else str(b)
@@ -145,10 +159,12 @@ async def _stream_ollama(url: str, body: dict, model: str) -> AsyncIterator[str]
                     continue
                 content = chunk.get("message", {}).get("content", "")
                 done    = chunk.get("done", False)
-                sse = {"id": cid, "object": "chat.completion.chunk", "created": ts,
-                       "model": model,
-                       "choices": [{"index": 0, "delta": {"content": content},
-                                    "finish_reason": "stop" if done else None}]}
+                sse = {
+                    "id": cid, "object": "chat.completion.chunk",
+                    "created": ts, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": content},
+                                 "finish_reason": "stop" if done else None}],
+                }
                 yield f"data: {json.dumps(sse)}\n\n"
                 if done:
                     yield "data: [DONE]\n\n"
@@ -170,31 +186,47 @@ async def _stream_vllm(url: str, body: dict) -> AsyncIterator[str]:
 # ── Main dispatch ─────────────────────────────────────────────────────────────
 
 async def dispatch(
-    req: ChatCompletionRequest,
-    role: str = "coder",
-    messages: list[dict] | None = None,
+    req:        ChatCompletionRequest,
+    role:       str = "coder",
+    messages:   list[dict] | None = None,
+    session_id: str = "default",
 ) -> "dict | AsyncIterator[str]":
     """
     Route request to the correct model server.
-    `messages` overrides req.messages (used by agent_manager to inject
-    pre-built context from context_manager).
 
-    Phase 3.5: non-streaming calls are wrapped in asyncio.wait_for using
-    MODEL_CALL_TIMEOUT. A stalled vLLM or Ollama endpoint will raise
-    asyncio.TimeoutError instead of hanging the agent indefinitely.
-    Streaming paths are NOT wrapped — they have their own per-chunk
-    timeout behaviour via the httpx stream context.
+    Phase 4A.4: if USE_LITELLM=true, routes through gateway.gateway_dispatch()
+    instead of the direct Ollama/vLLM path. Flag is false by default — zero
+    behaviour change when disabled.
+
+    Phase 4A.2: session_id passed to resolve_endpoint() so RoutingPolicy
+    can look up per-session model overrides from Redis.
+
+    Phase 3.5: non-streaming calls wrapped in asyncio.wait_for(MODEL_CALL_TIMEOUT).
     """
-    endpoint, model, btype = await resolve_endpoint(role)
+    # Phase 4A.4: LiteLLM gateway (flag-gated, USE_LITELLM=false by default)
+    if config.USE_LITELLM:
+        from gateway import gateway_dispatch
+        msgs = messages or [m.model_dump(exclude_none=True) for m in req.messages]
+        _, model, _ = await resolve_endpoint(role, session_id)
+        return await gateway_dispatch(
+            messages=msgs,
+            model=model,
+            stream=req.stream,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+        )
+
+    endpoint, model, btype = await resolve_endpoint(role, session_id)
     msgs = messages or [m.model_dump(exclude_none=True) for m in req.messages]
-    log.info("dispatch  role=%s  backend=%s  endpoint=%s  stream=%s",
-             role, btype, endpoint, req.stream)
+    log.info(
+        "dispatch  role=%s  session=%s  backend=%s  model=%s  stream=%s",
+        role, session_id, btype, model, req.stream,
+    )
 
     if btype == "ollama":
         body = _build_ollama_body(msgs, model, req)
         if req.stream:
             return _stream_ollama(endpoint, body, model)
-        # Phase 3.5: timeout guard — raises asyncio.TimeoutError if stalled
         resp = await asyncio.wait_for(
             _client.post(f"{endpoint.rstrip('/')}/api/chat", json=body),
             timeout=config.MODEL_CALL_TIMEOUT,
@@ -210,8 +242,6 @@ async def dispatch(
             "choices": [{"index": 0,
                          "message": {"role": "assistant", "content": content},
                          "finish_reason": "stop"}],
-            # Pass Ollama's native token counts through so metrics.parse_usage()
-            # can find them. Ollama uses prompt_eval_count / eval_count at root.
             "usage": {
                 "prompt_tokens":     data.get("prompt_eval_count", 0),
                 "completion_tokens": data.get("eval_count",         0),
@@ -222,7 +252,6 @@ async def dispatch(
         body = _build_vllm_body(msgs, model, req)
         if req.stream:
             return _stream_vllm(endpoint, body)
-        # Phase 3.5: timeout guard — raises asyncio.TimeoutError if stalled
         resp = await asyncio.wait_for(
             _client.post(f"{endpoint.rstrip('/')}/chat/completions", json=body),
             timeout=config.MODEL_CALL_TIMEOUT,
