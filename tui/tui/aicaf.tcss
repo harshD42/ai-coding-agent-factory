@@ -1,0 +1,462 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   AICAF v0.5.1 — Catppuccin Mocha
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Base ─────────────────────────────────────────────────────────────────── */
+Screen {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    layers: base overlay notifications;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+HeaderBar {
+    height: 1;
+    background: #181825;
+    color: #a6adc8;
+    dock: top;
+    layer: base;
+    padding: 0 1;
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+FooterBar {
+    height: 1;
+    background: #181825;
+    color: #6c7086;
+    dock: bottom;
+    layer: base;
+    padding: 0 1;
+}
+
+/* ── Input bar ───────────────────────────────────────────────────────────── */
+InputBar {
+    height: 3;
+    background: #181825;
+    border-top: solid #313244;
+    dock: bottom;
+    layer: base;
+    padding: 0 1;
+}
+
+InputBar Input {
+    background: #181825;
+    border: none;
+    color: #cdd6f4;
+    height: 1;
+}
+
+InputBar Input:focus {
+    border: none;
+    background: #181825;
+}
+
+#input-hint {
+    height: 1;
+    color: #6c7086;
+}
+
+/* ── Session layout ──────────────────────────────────────────────────────── */
+#session-container {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#agent-area {
+    layout: grid;
+    height: 1fr;
+    grid-gutter: 0;
+}
+
+#agent-area.layout-full {
+    grid-size: 1;
+    grid-columns: 1fr;
+    grid-rows: 1fr;
+}
+
+#agent-area.layout-half-half {
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: 1fr;
+}
+
+#agent-area.layout-two-one {
+    grid-size: 2;
+    grid-columns: 2fr 3fr;
+    grid-rows: 1fr;
+}
+
+#agent-area.layout-two-two {
+    grid-size: 4;
+    grid-columns: 1fr 1fr;
+    grid-rows: 1fr 1fr;
+}
+
+#agent-area.layout-scroll {
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    overflow-y: auto;
+}
+
+/* ── Agent pane ──────────────────────────────────────────────────────────── */
+AgentPane {
+    background: #1e1e2e;
+    border: solid #313244;
+    padding: 0;
+    height: 1fr;
+    overflow: hidden;
+}
+
+AgentPane:focus {
+    border: solid #89b4fa;
+}
+
+AgentPane.streaming {
+    border: solid #89dceb;
+}
+
+AgentPane.failed {
+    border: solid #f38ba8;
+}
+
+AgentPane.hibernating {
+    border: solid #45475a;
+    opacity: 0.7;
+}
+
+/* Pane header — matches .pane-header class on the Static widget */
+.pane-header {
+    height: 1;
+    background: #181825;
+    padding: 0 1;
+    color: #a6adc8;
+}
+
+/* Pane log area — matches .pane-log class on the RichLog widget */
+.pane-log {
+    height: 1fr;
+    background: #1e1e2e;
+    overflow-y: auto;
+    padding: 0 1;
+}
+
+/* DagSidebar styling lives in widget DEFAULT_CSS */
+
+/* ── Launcher screen ─────────────────────────────────────────────────────── */
+#launcher-container {
+    align: center middle;
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+#launcher-logo {
+    color: #89b4fa;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#launcher-subtitle {
+    color: #6c7086;
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#projects-list {
+    height: auto;
+    max-height: 12;
+    overflow-y: auto;
+    border: solid #313244;
+    background: #181825;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+ProjectCard {
+    height: 1;
+    background: #181825;
+    color: #cdd6f4;
+    padding: 0 1;
+}
+
+ProjectCard:hover {
+    background: #313244;
+}
+
+ProjectCard.selected {
+    background: #313244;
+    color: #89b4fa;
+}
+
+#chat-panel {
+    border: solid #313244;
+    background: #181825;
+    padding: 1;
+    height: auto;
+    margin-top: 1;
+    layout: horizontal;
+}
+
+#orphan-list {
+    border: solid #45475a;
+    background: #181825;
+    padding: 0 1;
+    height: auto;
+    margin-bottom: 1;
+}
+
+/* ── New project / new session ───────────────────────────────────────────── */
+#new-project-container,
+#new-session-container {
+    align: center middle;
+    padding: 1 4;
+    max-width: 70;
+}
+
+.form-label {
+    color: #a6adc8;
+    width: 16;
+    height: 3;
+    content-align: left middle;
+}
+
+.form-input {
+    background: #313244;
+    border: solid #45475a;
+    color: #cdd6f4;
+    height: 3;
+    width: 1fr;
+}
+
+.form-input:focus {
+    border: solid #89b4fa;
+}
+
+/* ── Project screen ──────────────────────────────────────────────────────── */
+#project-container {
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+SessionCard {
+    height: 1;
+    background: #181825;
+    color: #cdd6f4;
+    padding: 0 1;
+}
+
+SessionCard:hover {
+    background: #313244;
+}
+
+SessionCard.active {
+    color: #a6e3a1;
+}
+
+SessionCard.ended {
+    color: #6c7086;
+}
+
+SessionCard.expired {
+    color: #45475a;
+}
+
+/* ── Chat screen ─────────────────────────────────────────────────────────── */
+#chat-container {
+    layout: vertical;
+    height: 1fr;
+}
+
+#chat-status-bar {
+    height: 1;
+    background: #181825;
+    padding: 0 1;
+}
+
+#chat-log {
+    height: 1fr;
+    overflow-y: auto;
+    padding: 0 2;
+    background: #1e1e2e;
+}
+
+/* ── Log viewer ──────────────────────────────────────────────────────────── */
+#logs-header {
+    height: 1;
+    background: #181825;
+    padding: 0 1;
+}
+
+#logs-content {
+    padding: 0 1;
+    overflow-y: auto;
+    height: 1fr;
+    background: #1e1e2e;
+}
+
+/* ── Help screen ─────────────────────────────────────────────────────────── */
+#help-container {
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+#help-log {
+    height: 1fr;
+    padding: 0 1;
+}
+
+/* ── Command palette overlay ─────────────────────────────────────────────── */
+#command-palette {
+    layer: overlay;
+    background: #181825;
+    border: solid #89b4fa;
+    width: 64;
+    height: auto;
+    max-height: 30;
+    align: center middle;
+    padding: 1;
+}
+
+#cp-filter {
+    background: #313244;
+    border: solid #45475a;
+    color: #cdd6f4;
+    height: 3;
+    margin-bottom: 0;
+}
+
+#cp-filter:focus {
+    border: solid #89b4fa;
+}
+
+#cp-list {
+    height: auto;
+    padding: 0 1;
+}
+
+/* ── Model config overlay ────────────────────────────────────────────────── */
+#model-config-container {
+    padding: 1 2;
+    max-width: 72;
+    align: center middle;
+}
+
+.role-label {
+    height: 1;
+    color: #a6adc8;
+    margin-top: 1;
+}
+
+/* ── Model panel ─────────────────────────────────────────────────────────── */
+#panel-title {
+    margin-bottom: 1;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+Button {
+    background: #313244;
+    color: #cdd6f4;
+    border: solid #45475a;
+    height: 3;
+    margin-top: 1;
+}
+
+Button:hover {
+    background: #45475a;
+    border: solid #89b4fa;
+}
+
+Button.primary {
+    background: #89b4fa;
+    color: #1e1e2e;
+    border: solid #89b4fa;
+}
+
+Button.primary:hover {
+    background: #b4befe;
+}
+
+Button.danger {
+    background: #313244;
+    color: #f38ba8;
+    border: solid #f38ba8;
+}
+
+/* ── Select / dropdown ───────────────────────────────────────────────────── */
+Select {
+    background: #313244;
+    color: #cdd6f4;
+    border: solid #45475a;
+    height: 3;
+    margin-bottom: 1;
+}
+
+Select:focus {
+    border: solid #89b4fa;
+}
+
+SelectOverlay {
+    background: #181825;
+    border: solid #89b4fa;
+}
+
+/* ── Collapsible ─────────────────────────────────────────────────────────── */
+Collapsible {
+    background: #181825;
+    border: solid #313244;
+    padding: 0 1;
+    margin-top: 1;
+}
+
+CollapsibleTitle {
+    color: #a6adc8;
+}
+
+CollapsibleTitle:hover {
+    color: #89b4fa;
+}
+
+/* ── Input (generic) ─────────────────────────────────────────────────────── */
+Input {
+    background: #313244;
+    border: solid #45475a;
+    color: #cdd6f4;
+    height: 3;
+}
+
+Input:focus {
+    border: solid #89b4fa;
+}
+
+/* ── Scrollbar ───────────────────────────────────────────────────────────── */
+ScrollBar {
+    background: #181825;
+    color: #45475a;
+}
+
+ScrollBar:hover {
+    color: #6c7086;
+}
+
+/* ── Utility classes ─────────────────────────────────────────────────────── */
+.muted    { color: #6c7086; }
+.accent   { color: #89b4fa; }
+.success  { color: #a6e3a1; }
+.warning  { color: #f9e2af; }
+.error    { color: #f38ba8; }
+
+.section-title {
+    color: #6c7086;
+    text-style: bold;
+    margin-top: 1;
+    margin-bottom: 0;
+}
+
+.divider {
+    color: #313244;
+    height: 1;
+}
+
+#agent-placeholder {
+    color: #6c7086;
+    padding: 2;
+}

@@ -7,6 +7,155 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.1] — 2026-03-12 — Phase 4B.4 TUI Stabilization
+
+### Summary
+First complete, zero-crash TUI release. All missing files created, all
+unregistered screens wired, all known bugs fixed. No new features — this
+version exists solely to make the existing TUI scaffold fully functional.
+
+---
+
+### Added
+
+**`tui/tui/__init__.py`**
+- Package init with `__version__ = "0.5.1"`
+
+**`tui/tui/screens/model_config.py`** — new file
+- `ModelConfigScreen(client, state, session_id)` — full-screen overlay
+  wrapping `ModelPanel`. On `ModelsConfigured` event: calls
+  `client.configure_models()`, updates `AppState.session.models`, shows
+  brief success flash, pops screen. Esc cancels without applying.
+
+**`tui/tui/screens/command_palette.py`** — new file
+- `CommandPaletteScreen(partial, on_execute, command_history)` — floating
+  overlay (64 cols, centered). Contains a filter `Input` pre-populated with
+  `partial`. `ListView`-style rendering of all 14 registered commands,
+  fuzzy prefix-filtered as user types. Arrow keys navigate list. Enter
+  executes selected command via injected `on_execute` async callable.
+  Arrow-up in empty filter input cycles `command_history` deque (20 items).
+  Esc dismisses without executing.
+- Full command list: `architect`, `execute`, `review`, `test`, `debate`,
+  `memory`, `spawn`, `kill`, `model`, `index`, `status`, `learn`, `end`,
+  `help`. `/debate` explicitly noted as opt-in, not triggered by `/architect`.
+
+**`tui/tui/screens/help.py`** — new file
+- `HelpScreen` — full-screen keybinding reference. 7 sections: Global,
+  Session, Chat, Launcher, Project, Command Palette, Input Bar. Esc closes.
+
+**`tui/tui/services/session_service.py`** — `handle_inline_command()` added
+- Executes `/commands` typed in the session input bar directly against the
+  orchestrator without opening the command palette.
+- Supported inline: `architect`, `execute`, `review`, `test`, `debate`,
+  `memory`, `spawn`, `kill`, `index`, `status`, `learn`, `end`.
+- Special return values signal the session screen to open overlays:
+  `__open_model_config__`, `__open_command_palette__`, `__open_help__`.
+- Unknown commands return `__open_command_palette__` so the palette opens
+  as a fallback. Never raises — errors returned as strings.
+
+### Changed
+
+**`tui/tui/__init__.py`**
+- Version bumped `0.5.0` → `0.5.1`
+
+**`tui/tui/app.py`**
+- Screen router extended with three new entries: `"model_config"`,
+  `"command_palette"`, `"help"` — previously unregistered, caused
+  `ValueError` on `m`, `/`, and `?` keypresses in session screen.
+- Factory methods added: `_make_model_config()`, `_make_command_palette()`,
+  `_make_help()`.
+- All three new screen imports added.
+
+**`tui/tui/screens/session.py`**
+- `_cancel_all_tasks()` — added null guard: skips `None` tasks and already-
+  done tasks. Fixes task leak when screen unmounts before `_init()` completes.
+- `on_input_bar_command_triggered()` — now calls
+  `sess_svc.handle_inline_command()` first; only opens command palette for
+  unknown commands or `__open_command_palette__` signal. Inline results
+  logged to `AppState.session.event_log` as system events.
+- `_cmd_history: deque` — 20-item command history shared with
+  `CommandPaletteScreen` across invocations.
+- `on_key()` — `"model_config"`, `"command_palette"`, `"help"` all route
+  correctly now via registered screen names.
+
+**`tui/tui/widgets/agent_pane.py`**
+- `compose()` — header `Static` and content `RichLog` now use
+  `classes="pane-header"` and `classes="pane-log"` respectively instead of
+  id-based selectors. Fixes CSS mismatch where `#pane-header` and
+  `#pane-content` selectors in `aicaf.tcss` never matched.
+- `_on_flush()` — scroll anchoring added: only calls `scroll_end()` when
+  `self._at_bottom` is `True`. `on_scroll()` updates `_at_bottom` by
+  comparing `scroll_y` to `virtual_size.height - size.height`.
+- `_header_text()` — token count added to right side of header.
+- `on_unmount()` — animation task cancel now guards `not task.done()`.
+
+**`tui/tui/widgets/dag_sidebar.py`**
+- Removed `DEFAULT_CSS` block entirely. All sidebar styling lives in
+  `aicaf.tcss`. The Python-level `DEFAULT_CSS` was redundant and fragile
+  (app-level CSS silently overrides widget-level CSS).
+- Models section now shows `[m] reconfigure` hint inline.
+
+**`tui/tui/widgets/footer_bar.py`**
+- Added missing hint entries for `"new_project"`, `"new_session"`,
+  `"help"`, `"model_config"`, `"command_palette"`. Previously these screens
+  would show an empty footer bar.
+
+**`tui/tui/widgets/input_bar.py`**
+- Command history: `_history: deque[str](maxlen=20)` and `_history_idx`
+  added. Arrow-up/down cycle through history when input is focused.
+  History is saved on every `Submitted` or `CommandTriggered` event.
+  Consecutive identical entries are deduplicated.
+- `on_mount()` — auto-focuses the inner `Input` on mount.
+- `on_key()` — `prevent_default()` + `stop()` called on Up/Down so
+  Textual's default focus-cycling behavior does not interfere.
+
+**`tui/tui/widgets/model_panel.py`**
+- `init_val` bug fixed: was using an inverted dict comprehension
+  `{v: l for l, v in opts}` which always evaluated `False`, causing the
+  current model to never be pre-selected. Replaced with:
+  `option_values = [v for _, v in opts]; init_val = cur if cur in option_values else opts[0][1]`
+
+**`tui/tui/aicaf.tcss`**
+- `#pane-header` → `.pane-header`, `#pane-content` → `.pane-log` to match
+  widget class attributes set in `agent_pane.py`.
+- Added `#input-hint`, `#chat-status-bar`, `#logs-header`, `#help-container`,
+  `#help-log`, `#cp-filter`, `#cp-list`, `#model-config-container`,
+  `#agent-placeholder` selectors.
+- Added `Collapsible` and `CollapsibleTitle` styling.
+- Added `Input` generic styling (used by new project / new session forms).
+- All redundant inline widget `DEFAULT_CSS` now consolidated here.
+
+### Fixed
+
+| # | File | Issue |
+|---|---|---|
+| 1 | `app.py` | `"model_config"` screen not registered → `ValueError` on `m` key |
+| 2 | `app.py` | `"command_palette"` screen not registered → `ValueError` on `/` |
+| 3 | `app.py` | `"help"` screen not registered → `ValueError` on `?` key |
+| 4 | `session.py` | Task leak: `_cancel_all_tasks()` called on `None` tasks |
+| 5 | `model_panel.py` | `init_val` always fell back to first option regardless of stored model |
+| 6 | `agent_pane.py` | CSS id mismatch: `#pane-header`/`#pane-content` never matched rendered ids |
+| 7 | `dag_sidebar.py` | Redundant `DEFAULT_CSS` conflicting with `aicaf.tcss` |
+| 8 | `agent_pane.py` | Auto-scroll yanked viewport when user had scrolled up |
+| 9 | `session.py` | `/commands` in input bar always tried to open unregistered palette screen |
+| 10 | `input_bar.py` | No command history — arrow-up had no effect |
+| 11 | `footer_bar.py` | Missing hint entries for `new_project`, `new_session`, `help`, `model_config`, `command_palette` |
+
+### Notes
+- `handle_inline_command()` routes through `POST /v1/chat/completions` for
+  agent-spawning commands (`architect`, `review`, `test`) to preserve the
+  OpenAI-compatible streaming path. Direct API calls are used for structural
+  commands (`execute`, `index`, `status`, `spawn`, `kill`, `learn`, `end`).
+- Command history is not persisted to disk in v0.5.1 — it lives in
+  `AppState.ui` for the session lifetime only. Disk persistence is part of
+  the v0.6.0 session log work.
+- `chat.py` scroll anchoring is deferred to v0.6.0 when `ConversationLog`
+  replaces the `RichLog` in chat mode. The pattern is identical to what was
+  applied to `AgentPane`.
+- The `executor_client.py` backend file required no changes for v0.5.1.
+
+---
+
 ## [0.5.0] — 2026-03-09 — Phase 4B Complete (Sessions · Streaming · Agent Bus)
 
 ### Added

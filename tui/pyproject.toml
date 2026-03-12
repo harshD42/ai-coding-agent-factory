@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aicaf"
+version = "0.5.1"
+description = "AI Coding Agent Factory — terminal interface"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=0.80.0",
+    "httpx>=0.27.2",
+    "httpx-sse>=0.4.0",
+    "websockets>=13.0",
+    "pydantic>=2.9.2",
+    "rich>=13.0.0",
+    "platformdirs>=4.0.0",
+]
+
+[project.scripts]
+aicaf = "tui.main:main"
+
+[project.optional-dependencies]
+dev = ["textual-dev>=0.80.0"]
+
+[tool.setuptools.package-data]
+"tui" = ["*.tcss"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tui*"]
